@@ -1,0 +1,8 @@
+.env
+state.json
+app.log
+*.log
+run.log
+backups/
+__pycache__/
+*.pyc

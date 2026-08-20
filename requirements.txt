@@ -1,2 +1,4 @@
 requests>=2.28.0
 numpy>=1.22.0
+hyperliquid-python-sdk>=0.13.0
+eth-account>=0.8.0
