@@ -37,9 +37,37 @@ except Exception:
 logging.basicConfig(filename=LOG_FILE, level=logging.INFO,
                     format='%(asctime)s %(levelname)s %(message)s')
 
+# ---- secret sanitizer: never write keys/tokens into logs (issue #4) ----
+_SECRET_VALUES = []
+
+def _collect_secrets():
+    """Gather sensitive env values so they can be masked out of logs."""
+    global _SECRET_VALUES
+    vals = set()
+    for k in ('HL_AGENT_PRIVATE_KEY', 'TG_TOKEN', 'DASH_PASS', 'NOBITEX_TOKEN',
+              'HL_ACCOUNT_ADDRESS'):
+        v = os.environ.get(k, '').strip()
+        if v and len(v) >= 4:
+            vals.add(v)
+    _SECRET_VALUES = sorted(vals, key=len, reverse=True)
+
+def mask_secrets(text):
+    """Replace known secrets + raw 0x private keys with [REDACTED]."""
+    try:
+        t = str(text or '')
+        for v in _SECRET_VALUES:
+            if v and v in t:
+                t = t.replace(v, '[REDACTED]')
+        import re
+        t = re.sub(r'0x[0-9a-fA-F]{60,64}', '[REDACTED_KEY]', t)
+        t = re.sub(r'\b(?:private[_ ]?key|secret)[^\n]{0,80}:?\s*0x[0-9a-fA-F]{20,}', '[REDACTED]', t, flags=re.I)
+        return t
+    except Exception:
+        return str(text or '')
+
 def log_exception(context=''):
     try:
-        logging.error("%s\n%s", context, tb.format_exc())
+        logging.error("%s\n%s", mask_secrets(context), mask_secrets(tb.format_exc()))
     except Exception:
         pass
 
@@ -61,6 +89,14 @@ def load_env_file():
         log_exception('.env parse failed')
 
 load_env_file()
+_collect_secrets()   # cache secrets so they can be masked out of logs
+
+# timezone override (default Tehran UTC+3:30) — issue #14
+try:
+    off = float(os.environ.get('BOT_TZ_OFFSET_HOURS', '3.5'))
+    TEHRAN = timezone(timedelta(hours=off))
+except Exception:
+    pass
 
 # ---------- packages ----------
 if os.environ.get('NO_AUTO_INSTALL'):
@@ -81,10 +117,15 @@ else:
         import hyperliquid  # noqa
     except Exception:
         subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'hyperliquid-python-sdk', '-q'])
+    try:
+        import websocket  # noqa
+    except Exception:
+        subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'websocket-client', '-q'])
 
 import requests
 import numpy as np
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
+import json as _json
 
 # ============ Static config (strategy baseline) ============
 
@@ -141,16 +182,28 @@ _hl_meta = [None]
 _hl_lock = threading.Lock()
 
 def hl_info():
-    """Read-only Hyperliquid client (cached)."""
+    """Read-only Hyperliquid client (cached, with auto-retry on init)."""
     with _hl_lock:
         if _hl_info[0] is None:
             from hyperliquid.info import Info
-            _hl_info[0] = Info(hl_base_url(), skip_ws=True)
+            _hl_info[0] = _net_call(lambda: Info(hl_base_url(), skip_ws=True), retries=3, base_wait=1.0)
         return _hl_info[0]
+
+def _net_call(fn, retries=2, base_wait=1.0):
+    """Retry a network call with short exponential backoff (issues #3, #5)."""
+    last = None
+    for i in range(retries + 1):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            if i < retries:
+                time.sleep(base_wait * (i + 1))
+    raise last
 
 def hl_meta():
     if _hl_meta[0] is None:
-        m = hl_info().meta()
+        m = _net_call(lambda: hl_info().meta(), retries=3, base_wait=1.0)
         uni = m.get('universe', [])
         names = [u.get('name') for u in uni]
         _hl_meta[0] = {
@@ -210,6 +263,7 @@ def default_state():
 
 def add_log(msg):
     try:
+        msg = mask_secrets(msg)
         logging.info('%s', msg)
         state['logs'].append({'t': fa_now().strftime('%H:%M:%S'), 'm': msg})
         if len(state['logs']) > 80:
@@ -223,6 +277,12 @@ def save_state():
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(state, f, ensure_ascii=False, default=str)
         os.replace(tmp, STATE_FILE)
+        # keep a rolling backup so a corrupt write never wipes history (issue #18)
+        try:
+            import shutil
+            shutil.copy2(STATE_FILE, STATE_FILE + '.bak')
+        except Exception:
+            pass
     except Exception:
         log_exception('save_state failed')
 
@@ -301,7 +361,8 @@ def get_candles(symbol, resolution='60', count=30, with_volume=False, drop_formi
         step_ms = RES_MS.get(iv, 3600000)
         now_ms = int(time.time() * 1000)
         start_ms = now_ms - (count + 3) * step_ms
-        d = hl_info().candles_snapshot(symbol, iv, start_ms, now_ms)
+        d = _net_call(lambda: hl_info().candles_snapshot(symbol, iv, start_ms, now_ms),
+                      retries=2, base_wait=1.0)
         if not d:
             return (None, None) if with_volume else None
         closes = [float(x['c']) for x in d]
@@ -316,17 +377,23 @@ def get_candles(symbol, resolution='60', count=30, with_volume=False, drop_formi
     except Exception:
         return (None, None) if with_volume else None
 
-_candle_cache = {}
+from collections import OrderedDict
+_candle_cache = OrderedDict()
+_CANDLE_CACHE_MAX = 150   # bounded so long runs cannot OOM (issue #15)
 
 def get_candles_cached(coin, resolution='60', count=30, max_age=240, drop_forming=False):
     key = (coin, resolution, count, bool(drop_forming))
     now = time.time()
     hit = _candle_cache.get(key)
     if hit and now - hit[0] < max_age:
+        _candle_cache.move_to_end(key)
         return hit[1]
     c = get_candles(coin, resolution, count, drop_forming=drop_forming)
     if c:
         _candle_cache[key] = (now, c)
+        _candle_cache.move_to_end(key)
+        while len(_candle_cache) > _CANDLE_CACHE_MAX:
+            _candle_cache.popitem(last=False)
     return c
 
 def get_price(coin):
@@ -337,11 +404,22 @@ def get_price(coin):
     except Exception:
         return None
 
+def _count_price_failure():
+    """Track consecutive price failures; warn once if the feed is down (issue #5)."""
+    try:
+        state['price_fails'] = state.get('price_fails', 0) + 1
+        if state['price_fails'] in (5, 10, 30):
+            add_log(f'PRICE FEED: {state["price_fails"]} consecutive failures')
+            send_telegram(f'⚠️ {state["price_fails"]} بار پشت‌سرهم دریافت قیمت ناموفق بود! اینترنت/API هایپرلیکوئید رو چک کن.')
+    except Exception:
+        pass
+
 def get_prices():
     """Refresh state['prices'] for all scanned coins; returns True on success."""
     try:
-        m = hl_info().all_mids()
+        m = _net_call(lambda: hl_info().all_mids(), retries=2, base_wait=1.0)
         if not m:
+            _count_price_failure()
             return False
         prices = {}
         for c in SCAN_COINS:
@@ -351,7 +429,9 @@ def get_prices():
                 except Exception:
                     pass
         if not prices:
+            _count_price_failure()
             return False
+        state['price_fails'] = 0
         with state_lock:
             state['prices'] = prices
             state['prices_ts'] = fa_now().strftime('%H:%M:%S')
@@ -366,7 +446,7 @@ def get_prices():
 
 def get_orderbook_info(coin):
     try:
-        bk = hl_info().l2_snapshot(coin)
+        bk = _net_call(lambda: hl_info().l2_snapshot(coin), retries=2, base_wait=1.0)
         levels = bk.get('levels', [[], []])
         bids = levels[0][:10]
         asks = levels[1][:10]
@@ -570,11 +650,15 @@ def funding_score_bonus(direction):
 
 # ---------- signal scoring ----------
 
-def analyze_coin(coin):
-    prices = get_candles_cached(coin, '60', 25, drop_forming=True)
-    if not prices or len(prices) < 20:
-        return None
-    prices = prices[-20:]
+def _score_signal(prices, coin):
+    """UNIFIED price-based signal scoring — used identically by LIVE (analyze_coin)
+    and BACKTEST (_bt_entry_signal). Guarantees the backtest calibrates the SAME
+    signal the live bot actually trades (fixes the historical live/backtest divergence).
+
+    Rules (all shared): RSI anchor + deep, last-candle penalty, falling-knife/pump
+    warning, momentum +/- with opposing penalty, trend +/- with opposing penalty.
+    """
+    prices = list(prices[-20:])
     gains, losses = [], []
     for i in range(1, len(prices)):
         ch = prices[i] - prices[i - 1]
@@ -657,9 +741,20 @@ def analyze_coin(coin):
             score += weighted(1, 'trend')
             factors.append('trend')
             reasons.append(f'{fa}: روند کوتاه نزولی (+1)')
-    return {'coin': coin, 'rsi': rsi, 'momentum': mom, 'sma7': sma7, 'sma20': sma20,
+    return {'rsi': rsi, 'momentum': mom, 'sma7': sma7, 'sma20': sma20,
             'score': score, 'direction': direction, 'reasons': reasons,
             'rsi_anchor': rsi_anchor, 'factors': factors}
+
+def analyze_coin(coin):
+    prices = get_candles_cached(coin, '60', 25, drop_forming=True)
+    if not prices or len(prices) < 20:
+        return None
+    core = _score_signal(prices, coin)
+    return {'coin': coin, 'rsi': core['rsi'], 'momentum': core['momentum'],
+            'sma7': core['sma7'], 'sma20': core['sma20'],
+            'score': core['score'], 'direction': core['direction'],
+            'reasons': core['reasons'], 'rsi_anchor': core['rsi_anchor'],
+            'factors': core['factors']}
 
 def trend_of(closes):
     if not closes or len(closes) < 10:
@@ -1345,15 +1440,52 @@ def hl_exchange():
 def hl_account():
     return os.environ.get('HL_ACCOUNT_ADDRESS', '').strip()
 
-def hl_test_connection():
-    """Verify keys: read account state via the agent. Returns (ok, info)."""
+def hl_agent_approved():
+    """Check the agent wallet is registered on Hyperliquid. Returns True/False/None."""
     try:
         ex = hl_exchange()
         if ex is None:
-            return False, 'کلید Agent یا آدرس Master تنظیم نشده'
+            return None
+        agents = _net_call(lambda: hl_info().extra_agents(hl_account()), retries=2, base_wait=1.0) or []
+        agent_addr = ex.wallet.address.lower()
+        for a in agents:
+            if isinstance(a, dict) and str(a.get('address', '')).lower() == agent_addr:
+                return True
+        return False
+    except Exception:
+        log_exception('hl_agent_approved')
+        return None
+
+def hl_position_size(coin):
+    """Actual signed size of an open position on the exchange (0 if none)."""
+    try:
+        st = _net_call(lambda: hl_info().user_state(hl_account()), retries=2, base_wait=1.0)
+        for p in st.get('assetPositions', []):
+            if p['position'].get('coin') == coin:
+                return float(p['position'].get('szi') or 0)
+        return 0.0
+    except Exception:
+        log_exception('hl_position_size')
+        return None
+
+def hl_test_connection():
+    """Verify keys + agent approval. Returns (ok, info)."""
+    try:
+        ex = hl_exchange()
+        if ex is None:
+            state['hl_block_reason'] = 'کلید Agent یا آدرس Master تنظیم نشده'
+            return False, state['hl_block_reason']
         st = ex.info.user_state(hl_account())
         ms = st.get('marginSummary', {})
         val = float(ms.get('accountValue', 0) or 0)
+        approved = hl_agent_approved()
+        if approved is False:
+            state['hl_block_reason'] = 'Agent Wallet توی هایپرلیکوئید تایید نشده (Settings → API Wallets)'
+            return False, state['hl_block_reason']
+        if approved is None:
+            state['hl_block_reason'] = ''
+        else:
+            state['hl_block_reason'] = ''
         return True, f'اتصال موفق - موجودی حساب: {val:.2f}$'
     except Exception as e:
         return False, f'خطا در اتصال: {e}'
@@ -1363,7 +1495,7 @@ def sync_live_capital(quiet=False):
     if ex is None:
         return None
     try:
-        st = ex.info.user_state(hl_account())
+        st = _net_call(lambda: ex.info.user_state(hl_account()), retries=2, base_wait=1.0)
         ms = st.get('marginSummary', {})
         val = float(ms.get('accountValue', 0) or 0)
         lg = get_ledger('live')
@@ -1372,6 +1504,18 @@ def sync_live_capital(quiet=False):
                 lg['capital'] = val
             if not state.get('live_base') or state.get('live_base') <= 0:
                 state['live_base'] = val
+            # balance monitoring (issue #24): warn on unexplained drops
+            last = state.get('live_cap_last')
+            if last and not lg['positions']:
+                drop = (last - val) / last
+                if drop > 0.15 and not state.get('balance_warned'):
+                    state['balance_warned'] = True
+                    add_log(f'BALANCE DROP: {last:.2f}$ -> {val:.2f}$ ({(drop*100):.0f}%) while no open positions')
+                    send_telegram(f'⚠️ موجودی حساب {val:.2f}$ شده (قبلاً {last:.2f}$) بدون پوزیشن باز!\n'
+                                  f'شاید برداشت دستی یا کارمزد بوده. چک کن.')
+            if val > last or (last and drop <= 0.05):
+                state['balance_warned'] = False
+            state['live_cap_last'] = val
         return val
     except Exception:
         log_exception('sync_live_capital')
@@ -1408,10 +1552,35 @@ def hl_place_sl(pos, size=None):
                 pos['sl_oid'] = sts['resting']['oid']
                 pos['sl_px'] = float(trigger_px)
                 add_log(f'Backstop SL {coin}: {trigger_px} (oid {pos["sl_oid"]})')
+                return True
+            else:
+                add_log(f'Backstop SL {coin}: unexpected statuses {sts}')
         else:
-            add_log(f'Backstop SL failed {coin}: {resp}')
+            add_log(f'Backstop SL failed {coin}: {mask_secrets(resp)}')
     except Exception:
         log_exception('hl_place_sl')
+    # retry a few times so an unprotected position never goes silent (issue #12)
+    for attempt in range(1, 4):
+        try:
+            time.sleep(2 * attempt)
+            resp = ex.order(coin, is_buy, sz, limit_px,
+                            {"trigger": {"triggerPx": str(trigger_px), "isMarket": True, "tpsl": "sl"}},
+                            reduce_only=True)
+            if resp.get('status') == 'ok':
+                sts = resp['response']['data']['statuses'][0]
+                if 'resting' in sts:
+                    pos['sl_oid'] = sts['resting']['oid']
+                    pos['sl_px'] = float(trigger_px)
+                    add_log(f'Backstop SL retry#{attempt} OK {coin}: {trigger_px}')
+                    return True
+        except Exception:
+            continue
+    if not pos.get('sl_alerted'):
+        pos['sl_alerted'] = True
+        add_log(f'🚨 BACKSTOP SL FAILED permanently for {coin} - position UNPROTECTED')
+        send_telegram(f'🚨 استاپ محافظ برای {COIN_FA.get(coin, coin)} نصب نشد (۳ بار تلاش)!\n'
+                      f'پوزیشن بدون استاپ روی صرافی مونده - ربات خودش مدیریت می‌کنه ولی لطفاً چک کن.')
+    return False
 
 def hl_cancel_sl(pos):
     ex = hl_exchange()
@@ -1449,7 +1618,7 @@ def hl_open_live(coin, direction, margin, price, lev):
         px = round(price, px_dec)
         resp = ex.market_open(coin, direction == 'long', sz, px=px, slippage=0.01)
         if resp.get('status') != 'ok':
-            add_log(f'LIVE open failed {coin}: {resp}')
+            add_log(f'LIVE open failed {coin}: {mask_secrets(resp)}')
             send_telegram(f'⚠️ باز کردن {COIN_FA.get(coin)} در هایپرلیکوئید ناموفق بود: {resp.get("response")}')
             return None
         sts = resp['response']['data']['statuses'][0]
@@ -1462,6 +1631,42 @@ def hl_open_live(coin, direction, margin, price, lev):
         else:
             add_log(f'LIVE open {coin}: unexpected statuses {sts}')
             return None
+        # slippage check (issue #13): warn if fill is far from the mid we sent
+        try:
+            slip = abs(avg - px) / px if px else 0.0
+            if slip > 0.01:
+                add_log(f'SLIPPAGE WARN {coin}: expected {px}, filled {avg} ({slip*100:.2f}%)')
+                send_telegram(f'⚠️ اسلیپیج زیاد در {COIN_FA.get(coin)}: ورود {fmt_price(avg)} (انتظار {fmt_price(px)})')
+        except Exception:
+            pass
+        # verify actual position on the exchange (partial fills / rejections — issues #6, #9)
+        actual = hl_position_size(coin)
+        if actual is None:
+            add_log(f'LIVE open {coin}: could not verify position size - using order size {sz}')
+        elif abs(actual) < 1e-12:
+            add_log(f'LIVE open {coin}: exchange shows NO position after open - treating as failed')
+            send_telegram(f'⚠️ {COIN_FA.get(coin)} باز شد ولی پوزیشنی روی صرافی ثبت نشد!')
+            return None
+        else:
+            want_sign = 1 if direction == 'long' else -1
+            if actual * want_sign < 0:
+                add_log(f'LIVE open {coin}: position sign mismatch ({actual}) - aborting')
+                return None
+            if abs(actual) < sz * 0.5:
+                add_log(f'LIVE open {coin}: PARTIAL FILL - asked {sz}, got {abs(actual)}')
+                send_telegram(f'⚠️ پرشدن جزئی {COIN_FA.get(coin)}: سفارش {sz} ولی {abs(actual)} پر شد')
+            sz = abs(actual)
+            # use the exchange's real entry price when available
+            try:
+                st = _net_call(lambda: hl_info().user_state(hl_account()), retries=1, base_wait=0.5)
+                for p in st.get('assetPositions', []):
+                    if p['position'].get('coin') == coin:
+                        ep = float(p['position'].get('entryPx') or 0)
+                        if ep > 0:
+                            avg = ep
+                        break
+            except Exception:
+                pass
         add_log(f'LIVE opened {direction} {coin} sz={sz} @ {avg} (oid {oid})')
         return {'oid': oid, 'entry': avg, 'size': sz}
     except Exception:
@@ -1777,75 +1982,108 @@ def _bt_entry_signal(closes, vols, i, coin, threshold, sl, tp):
     if i < 20:
         return None
     prices = closes[i - 20:i + 1]
-    gains, losses = [], []
-    for j in range(1, len(prices)):
-        ch = prices[j] - prices[j - 1]
-        gains.append(max(0, ch))
-        losses.append(max(0, -ch))
-    ag, al = np.mean(gains[-14:]), np.mean(losses[-14:])
-    rsi = 100 - (100 / (1 + ag / max(al, 1e-9))) if (ag + al) > 1e-12 else 50
-    mom = (prices[-1] - prices[-5]) / prices[-5] if len(prices) > 5 else 0
-    sma7, sma20 = np.mean(prices[-7:]), np.mean(prices[-20:])
-    score, direction = 0, None
-    g = get_genome()
-    if rsi < g['rsi_lo']:
-        score += 3
-        direction = 'long'
-    elif rsi > g['rsi_hi']:
-        score += 3
-        direction = 'short'
-    if mom > 0.005 and direction != 'short':
-        score += 2
-        direction = direction or 'long'
-    elif mom < -0.005 and direction != 'long':
-        score += 2
-        direction = direction or 'short'
-    if direction == 'long' and (sma7 - sma20) / max(sma20, 1e-9) < -0.0015:
-        score -= 1
-    if direction == 'short' and (sma20 - sma7) / max(sma20, 1e-9) < -0.0015:
-        score -= 1
-    if score >= threshold and direction:
-        return {'coin': coin, 'direction': direction, 'score': score}
+    core = _score_signal(prices, coin)
+    # same entry filter as the live bot: RSI-anchored direction + threshold
+    if core['rsi_anchor'] and core['direction'] and core['score'] >= threshold:
+        return {'coin': coin, 'direction': core['direction'], 'score': core['score']}
     return None
 
 def bt_on_data(closes, vols, coin, sl, tp, threshold):
+    """Full backtest engine — simulates ALL exit rules from manage_engine_pos
+    (partial TP 40%%, half-cash 50%%, breakeven lock, ladder1, trailing,
+     runner mode, max-age). Uses same entry filter as live bot."""
     if not closes or len(closes) < 30:
         return None
-    entries, pnls = [], []
-    entry = exit_px = None
-    direction = None
-    for i in range(len(closes)):
-        px = closes[i]
-        if entry is None:
-            sig = _bt_entry_signal(closes, vols, i, coin, threshold, sl, tp)
-            if sig:
-                entry = px
-                direction = sig['direction']
-                entries.append({'i': i, 'px': px, 'dir': direction})
+    pnls, reasons = [], []
+    idx = 0
+    while idx < len(closes):
+        sig = _bt_entry_signal(closes, vols, idx, coin, threshold, sl, tp)
+        if not sig:
+            idx += 1
             continue
-        stop = entry * (1 - sl) if direction == 'long' else entry * (1 + sl)
-        targ = entry * (1 + tp) if direction == 'long' else entry * (1 - tp)
-        if (direction == 'long' and px <= stop) or (direction == 'short' and px >= stop):
-            exit_px = stop
-            reason = 'sl'
-        elif (direction == 'long' and px >= targ) or (direction == 'short' and px <= targ):
-            exit_px = targ
-            reason = 'tp'
-        else:
-            continue
-        pnl = ((exit_px - entry) / entry) if direction == 'long' else ((entry - exit_px) / entry)
-        pnl = pnl * 100  # percent on notional (x1)
-        pnls.append(round(pnl, 3))
-        entry = exit_px = None
-        direction = None
+        entry_px = closes[idx]
+        direction = sig['direction']
+        best_px = entry_px
+        entry_sl = entry_px * (1 - sl) if direction == 'long' else entry_px * (1 + sl)
+        entry_tp = entry_px * (1 + tp) if direction == 'long' else entry_px * (1 - tp)
+        sl_px = entry_sl
+        tp_dist = tp
+        partial_trig = tp_dist * 0.5
+        be_trig = tp_dist * 0.40
+        trail_trig = tp_dist * 0.75
+        state_flags = {'partial': False, 'half': False, 'runner': False, 'trail': False}
+        traded = False
+        for j in range(idx + 1, len(closes)):
+            px = closes[j]
+            age_h = (j - idx)  # in candle count, ~hours
+            gain = ((px - entry_px) / entry_px) if direction == 'long' else ((entry_px - px) / entry_px)
+            # Exit reasons (priority order)
+            exit_reason = None
+            # 1. Runner end
+            if state_flags.get('runner'):
+                rt = 0.002 if gain >= 0.04 else 0.010
+                if (direction == 'long' and px <= best_px * (1 - rt)) or (direction == 'short' and px >= best_px * (1 + rt)):
+                    exit_reason = 'runner_end'
+            # 2. Stop loss (hard or trailing)
+            if not exit_reason and sl_px is not None:
+                if (direction == 'long' and px <= sl_px) or (direction == 'short' and px >= sl_px):
+                    exit_reason = 'profit_lock' if state_flags.get('trail') else 'stop_loss'
+            # 3. Take profit -> runner mode
+            if not exit_reason and not state_flags.get('runner') and entry_tp is not None:
+                if (direction == 'long' and px >= entry_tp) or (direction == 'short' and px <= entry_tp):
+                    state_flags['runner'] = True
+            # 4. Trailing gap
+            if not exit_reason and state_flags.get('trail') and not state_flags.get('runner'):
+                gap = 0.004 if gain >= 0.025 else 0.012
+                if (direction == 'long' and px <= best_px * (1 - gap)) or (direction == 'short' and px >= best_px * (1 + gap)):
+                    exit_reason = 'profit_lock'
+            if exit_reason:
+                exit_px = px
+                pnl = ((exit_px - entry_px) / entry_px) if direction == 'long' else ((entry_px - exit_px) / entry_px)
+                pnls.append(round(pnl * 100, 3))
+                reasons.append(exit_reason)
+                traded = True
+                break
+            # State updates (same as manage_engine_pos)
+            if direction == 'long' and px > best_px:
+                best_px = px
+            elif direction == 'short' and px < best_px:
+                best_px = px
+            if not state_flags['half'] and gain >= be_trig:
+                state_flags['half'] = True
+            if not state_flags['partial'] and gain >= partial_trig:
+                state_flags['partial'] = True
+            if gain >= 0.012:
+                floor = entry_px * 1.002 if direction == 'long' else entry_px * 0.998
+                if (direction == 'long' and floor > (sl_px or 0)) or (direction == 'short' and floor < (sl_px or 1e9)):
+                    sl_px = floor
+            if gain >= tp_dist * 0.70:
+                lock = entry_px * (1 + gain * 0.40) if direction == 'long' else entry_px * (1 - gain * 0.40)
+                if (direction == 'long' and lock > (sl_px or 0)) or (direction == 'short' and lock < (sl_px or 1e9)):
+                    sl_px = lock
+            if (gain >= trail_trig or gain >= 0.025) and not state_flags['trail']:
+                lock = entry_px * (1 + gain * 0.60) if direction == 'long' else entry_px * (1 - gain * 0.60)
+                if (direction == 'long' and lock > (sl_px or 0)) or (direction == 'short' and lock < (sl_px or 1e9)):
+                    sl_px = lock
+                state_flags['trail'] = True
+            # Max age: 24 candles = 24h
+            if age_h >= 96:
+                exit_px = px
+                pnl = ((exit_px - entry_px) / entry_px) if direction == 'long' else ((entry_px - exit_px) / entry_px)
+                pnls.append(round(pnl * 100, 3))
+                reasons.append('max_age')
+                traded = True
+                break
+        idx += 1 if traded else 3
     if not pnls:
         return None
     wins = [p for p in pnls if p > 0]
-    losses = [p for p in pnls if p <= 0]
-    gw, gl = sum(wins), abs(sum(losses))
+    loses = [p for p in pnls if p <= 0]
+    gw, gl = sum(wins), abs(sum(loses))
     return {'trades': len(pnls), 'win_rate': round(len(wins) / len(pnls) * 100, 1),
             'profit_factor': round(gw / gl, 2) if gl > 0 else (99.0 if gw > 0 else 0),
-            'total_pct': round(sum(pnls), 2), 'avg': round(np.mean(pnls), 3)}
+            'total_pct': round(sum(pnls), 2), 'avg': round(np.mean(pnls), 3),
+            'breakdown': 'full (partial+trail+runner)'}
 
 def run_backtest(coin='BTC', days=30, sl=None, tp=None, threshold=None):
     closes = get_candles(coin, '60', days * 24, drop_forming=True)
@@ -1856,7 +2094,13 @@ def run_backtest(coin='BTC', days=30, sl=None, tp=None, threshold=None):
     sl = sl or STOP_LOSS
     tp = tp or TAKE_PROFIT
     threshold = threshold or get_tuned()['threshold']
-    return bt_on_data(closes, vols, coin, sl, tp, threshold)
+    result = bt_on_data(closes, vols, coin, sl, tp, threshold)
+    if result:
+        lev = eff_leverage(coin)
+        result["total_pct_lev"] = round(result["total_pct"] * lev, 2)
+        result["avg_lev"] = round(result["avg"] * lev, 3)
+        result["lev"] = lev
+    return result
 
 # ============ Per-coin permission filter ============
 
@@ -1899,7 +2143,7 @@ def perf_stats(lg_name='paper'):
     pnls = [t.get('pnl', 0) for t in trades]
     wins = [p for p in pnls if p > 0]
     losses = [p for p in pnls if p <= 0]
-    gw, gl = sum(wins), abs(sum(losses))
+    gw, gl = sum(wins), abs(sum(loses))
     eq = PAPER_CAPITAL if lg_name == 'paper' else live_base_capital()
     peak, max_dd = eq, 0.0
     for p in pnls:
@@ -2015,7 +2259,15 @@ def tg_poll():
             elif text.startswith('/ping'):
                 send_telegram('🏓 پونگ! ربات فعاله')
             elif text.startswith('/help'):
-                send_telegram('/status /paper /report /stop /start /killswitch /ping')
+                send_telegram('📋 <b>دستورات ربات</b>\n\n'
+                              '🔹 /status - وضعیت کلی حساب\n'
+                              '🔹 /paper - آمار موتور مجازی\n'
+                              '🔹 /report - گزارش کامل دو موتور\n'
+                              '🔹 /stop - توقف ورودهای جدید\n'
+                              '🔹 /start - ادامه معاملات\n'
+                              '🔹 /killswitch - توقف اضطراری (همه بسته)\n'
+                              '🔹 /ping - تست زنده بودن بات\n'
+                              '🔹 /help - راهنما')
         save_state()
     except Exception:
         pass
@@ -2059,16 +2311,99 @@ def heartbeat_text():
 
 # ============ MAIN LOOP ============
 
+def _ws_price_thread():
+    """Background WebSocket thread that receives real-time prices from
+    Hyperliquid every ~200ms — replaces 5-minute REST polling (S-03)."""
+    ws = None
+    while True:
+        try:
+            import websocket as _ws
+            url = hl_base_url().replace('https://', 'wss://') + '/ws'
+            ws = _ws.create_connection(url, timeout=10)
+            ws.send(_json.dumps({"type": "subscribe", "channel": "allMids"}))
+            ws.settimeout(30)
+            while True:
+                raw = ws.recv()
+                if not raw:
+                    continue
+                try:
+                    msg = _json.loads(raw)
+                    if msg.get('channel') == 'allMids':
+                        mids = msg.get('data', {}).get('mids', {})
+                        if mids:
+                            prices = {}
+                            for c in SCAN_COINS:
+                                v = mids.get(c)
+                                if v:
+                                    try:
+                                        prices[c] = float(v)
+                                    except Exception:
+                                        pass
+                            if prices:
+                                with state_lock:
+                                    state['prices'] = prices
+                                    state['prices_ts'] = fa_now().strftime('%H:%M:%S.%f')[:-3]
+                                    state['ws_connected'] = True
+                                    state['price_fails'] = 0
+                                    hist = state['price_history']
+                                    hist.append({'t': time.time(), 'p': prices.get('BTC')})
+                                    if len(hist) > 500:
+                                        state['price_history'] = hist[-500:]
+                except Exception:
+                    pass
+        except Exception:
+            state['ws_connected'] = False
+        finally:
+            try:
+                if ws:
+                    ws.close()
+            except Exception:
+                pass
+            time.sleep(5)  # reconnect delay
+
+def auto_backup():
+    """Daily state backup so a corrupted state.json never loses history (issue #20)."""
+    try:
+        if not os.path.exists(STATE_FILE):
+            return
+        bk_dir = os.path.join(BASE_DIR, 'backups')
+        os.makedirs(bk_dir, exist_ok=True)
+        name = f'state-{fa_now().strftime("%Y%m%d")}.json'
+        dst = os.path.join(bk_dir, name)
+        if not os.path.exists(dst):
+            import shutil
+            shutil.copy2(STATE_FILE, dst)
+            # keep only last 14 daily backups
+            files = sorted(f for f in os.listdir(bk_dir) if f.startswith('state-'))
+            for old in files[:-14]:
+                try:
+                    os.remove(os.path.join(bk_dir, old))
+                except Exception:
+                    pass
+    except Exception:
+        log_exception('auto_backup')
+
 def bot_loop():
     add_log(f'Hyperliquid bot v{STRATEGY_VERSION} started (paper always-on, live={"ON" if state["mode"]=="live" else "off"}, net={hl_base_url()})')
     state['status'] = 'Active'
+    # start WebSocket price feed in background (S-03)
+    try:
+        thr = threading.Thread(target=_ws_price_thread, daemon=True, name='ws-prices')
+        thr.start()
+        add_log('WebSocket price feed started')
+    except Exception:
+        log_exception('ws_thread')
     if state.get('mode') == 'live':
         ok, info = hl_test_connection()
         if not ok:
-            add_log(f'LIVE CONFIG INCOMPLETE: {info}')
-            send_telegram(f'⚠️ حالت لایو فعاله ولی اتصال هایپرلیکوئید برقرار نیست: {info}')
+            reason = state.get('hl_block_reason') or info
+            state['hl_block_reason'] = reason
+            add_log(f'LIVE BLOCKED: {reason}')
+            send_telegram(f'🚫 معاملات واقعی قفل است:\n{reason}\nربات فقط حالت مجازی ادامه می‌ده.')
         else:
             add_log(f'HL connection OK: {info}')
+            state['hl_agent_ok'] = True
+            state['hl_block_reason'] = ''
             sync_live_capital()
             reconcile_live_positions()
     last_scan = last_manage = last_funding = last_optimize = 0.0
@@ -2076,6 +2411,10 @@ def bot_loop():
     while True:
         try:
             now = time.time()
+            # daily auto-backup of state.json (issue #20)
+            if now - state.get('last_auto_bk', 0) > 86400:
+                state['last_auto_bk'] = now
+                auto_backup()
             if state.get('tg_token') and state.get('tg_chat'):
                 hhmm = fa_now().strftime('%H:%M')
                 today_s = fa_now().strftime('%Y-%m-%d')
@@ -2151,7 +2490,18 @@ def bot_loop():
                             for sig in sigs:
                                 if open_engine_position('paper', sig):
                                     break
-                            if state.get('mode') == 'live' and not state.get('crash_mode'):
+                            live_ok = (state.get('mode') == 'live' and state.get('hl_agent_ok')
+                                       and not state.get('crash_mode'))
+                            if state.get('mode') == 'live' and not state.get('hl_agent_ok'):
+                                # re-check once/hour in case the user fixed approval while running
+                                if now - state.get('last_live_retry', 0) > 3600:
+                                    state['last_live_retry'] = now
+                                    ok, _ = hl_test_connection()
+                                    state['hl_agent_ok'] = ok
+                                    if ok:
+                                        sync_live_capital()
+                                        reconcile_live_positions()
+                            if live_ok:
                                 for sig in sigs:
                                     if open_engine_position('live', sig):
                                         break
@@ -2364,19 +2714,49 @@ def create_analytics_html():
     b_eth = run_backtest('ETH', days=14)
     def bt_card(coin, res):
         if not res:
-            return f"<div class='card'><h3>بک‌تست {COIN_FA.get(coin)}</h3><div class='small'>داده کافی نیست</div></div>"
-        return f"""<div class='card'><h3>بک‌تست {COIN_FA.get(coin)} (۱۴ روز)</h3>
-<table><tr><td>معاملات</td><td>{res['trades']}</td></tr>
-<tr><td>وین‌ریت</td><td>{res['win_rate']}%</td></tr>
-<tr><td>پروفیت فاکتور</td><td class='{pf_color(res['profit_factor'])}'>{res['profit_factor']}</td></tr>
-<tr><td>بازده کل</td><td class='{"green" if res["total_pct"]>0 else "red"}'>{res['total_pct']:+.2f}%</td></tr></table></div>"""
-    return f"""<div class='grid'>{bt_card('BTC', b)}{bt_card('ETH', b_eth)}
-<div class='card'><h3>🎯 آستانه فعلی</h3>
-<table><tr><td>آستانه سیگنال</td><td>{live_threshold()}</td></tr>
-<tr><td>تعدیل یادگیری</td><td>{state.get('threshold_extra',0):+.1f}</td></tr>
-<tr><td>SL/TP پایه</td><td class='mono'>{get_tuned()['sl']*100:.1f}% / {get_tuned()['tp']*100:.1f}%</td></tr>
-<tr><td>سایه‌های در انتظار</td><td>{len(state.get('shadow_signals', []))}</td></tr></table></div>
-</div>"""
+            return "<div class='card'><h3>بک‌تست " + COIN_FA.get(coin) + "</h3><div class='small'>داده کافی نیست</div></div>"
+        pct_lev = res.get('total_pct_lev', 0)
+        lv = res.get('lev', 5)
+        lev_cls = 'green' if pct_lev > 0 else 'red'
+        return ("<div class='card'><h3>بک‌تست " + COIN_FA.get(coin) + " (14 روز)</h3>"
+                "<table><tr><td>معاملات</td><td>" + str(res['trades']) + "</td></tr>"
+                "<tr><td>وین‌ریت</td><td>" + str(res['win_rate']) + "%</td></tr>"
+                "<tr><td>پروفیت فاکتور</td><td class='" + pf_color(res['profit_factor']) + "'>" + str(res['profit_factor']) + "</td></tr>"
+                "<tr><td>بازده (x1)</td><td class='" + ("green" if res['total_pct']>0 else "red") + "'>" + f"{res['total_pct']:+.2f}%" + "</td></tr>"
+                "<tr><td>بازده (" + str(lv) + "x)</td><td class='" + lev_cls + "'>" + f"{pct_lev:+.2f}% 🔥" + "</td></tr></table></div>")
+
+    # Equity curve SVG
+    lg_p = get_ledger('paper')
+    eq_data = lg_p.get('equity', [])
+    eq_svg = ''
+    if len(eq_data) >= 3:
+        vals = [e['eq'] for e in eq_data if e.get('eq')]
+        if vals:
+            mn, mx = min(vals), max(vals)
+            rng = mx - mn if mx != mn else 1.0
+            w, h = 600, 160
+            pts = []
+            for i, v in enumerate(vals):
+                x = w * i // len(vals)
+                y = h - int(h * (v - mn) / rng)
+                pts.append(f'{x},{y}')
+            poly = ' '.join(pts)
+            eq_svg = ("<svg width='100%' height='140' viewBox='0 0 " + str(w) + " " + str(h) + "' style='margin:8px 0'>"
+                      "<rect width='" + str(w) + "' height='" + str(h) + "' fill='#161b22' rx='8'/>"
+                      "<polyline points='" + poly + "' fill='none' stroke='#3fb950' stroke-width='2' stroke-linejoin='round'/>"
+                      "<text x='" + str(w-4) + "' y='14' fill='#8b949e' font-size='11' text-anchor='end'>" + f"{mn:.2f}$" + "</text>"
+                      "<text x='" + str(w-4) + "' y='" + str(h-4) + "' fill='#8b949e' font-size='11' text-anchor='end'>" + f"{mx:.2f}$" + "</text>"
+                      "</svg>")
+
+    cap = get_ledger('paper')['capital']
+    return ("<div class='grid'>" + bt_card('BTC', b) + bt_card('ETH', b_eth) +
+            "<div class='card'><h3>📈 منحنی سرمایه (مجازی)</h3>" + eq_svg + "<div class='small'>آخرین: " + f"{cap:.2f}$" + "</div></div>"
+            "<div class='card'><h3>🎯 آستانه فعلی</h3>"
+            "<table><tr><td>آستانه سیگنال</td><td>" + str(live_threshold()) + "</td></tr>"
+            "<tr><td>تعدیل یادگیری</td><td>" + f"{state.get('threshold_extra',0):+.1f}" + "</td></tr>"
+            "<tr><td>SL/TP پایه</td><td class='mono'>" + f"{get_tuned()['sl']*100:.1f}% / {get_tuned()['tp']*100:.1f}%" + "</td></tr>"
+            "<tr><td>سایه‌های در انتظار</td><td>" + str(len(state.get('shadow_signals', []))) + "</td></tr></table></div></div>")
+
 
 def live_overview_page():
     l = get_ledger('live')
@@ -2455,6 +2835,20 @@ class Handler(SimpleHTTPRequestHandler):
 <button type='submit' style='margin-top:10px'>ورود</button></form></div></body></html>"""
                 self._send_html(body)
                 return
+        # ---- Force password change if still default (CR-01) ----
+        _dp = dash_pass()
+        if _dp and _dp.lower() == 'admin1234' and path != '/changepass':
+            body = ("""<!DOCTYPE html><html lang='fa'><head><meta charset='utf-8'><title>تغییر رمز</title><style>""" + _CSS + """</style></head><body>
+<div class='card' style='max-width:360px;margin:80px auto'>
+<h3>🔒 رمز پیش‌فرض را تغییر دهید</h3>
+<div class='small'>رمز داشبورد هنوز admin1234 است. برای امنیت، رمز جدیدی تنظیم کنید.</div>
+<form method='post' action='/login'>
+<label>رمز جدید (حداقل ۶ کاراکتر)</label><input type='password' name='pw' style='width:100%' minlength='6'>
+<label>تکرار رمز جدید</label><input type='password' name='pw2' style='width:100%' minlength='6'>
+<button type='submit' style='margin-top:10px'>تغییر رمز</button>
+</form></div></body></html>""")
+            self._send_html(body)
+            return
         if path == '/':
             self._send_html(shell('خانه', home_page()))
         elif path == '/paper':
@@ -2491,6 +2885,10 @@ class Handler(SimpleHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-Type', 'text/html; charset=utf-8')
         self.send_header('Content-Length', str(len(data)))
+        self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:")
+        self.send_header('X-Frame-Options', 'DENY')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('Referrer-Policy', 'no-referrer')
         self.end_headers()
         self.wfile.write(data)
 
@@ -2503,13 +2901,30 @@ class Handler(SimpleHTTPRequestHandler):
             def gv(k):
                 return (params.get(k) or [''])[0]
             if path == '/login':
+                # brute-force guard: max 5 attempts per 10 min per IP (issue #17)
+                ip = self.client_address[0] if self.client_address else '?'
+                now = time.time()
+                _rl = state.setdefault('login_rl', {})
+                # prune stale entries so the map can't grow forever
+                for k in [k for k, v in _rl.items() if now - v[0] > 600]:
+                    _rl.pop(k, None)
+                rec = _rl.get(ip)
+                if not rec or now - rec[0] > 600:
+                    _rl[ip] = [now, 0]
+                    rec = _rl[ip]
+                if rec[1] >= 5:
+                    self.send_response(429)
+                    self.end_headers()
+                    return
                 pw = gv('pw')
                 if _hash_pw(pw) == _hash_pw(dash_pass()):
+                    _rl[ip] = [now, 0]
                     self.send_response(302)
                     self.send_header('Location', '/')
                     self.send_header('Set-Cookie', f'sess={_hash_pw(pw)}; Path=/; Max-Age=604800')
                     self.end_headers()
                 else:
+                    rec[1] += 1
                     self.send_response(302)
                     self.send_header('Location', '/')
                     self.end_headers()
@@ -2565,7 +2980,7 @@ class Handler(SimpleHTTPRequestHandler):
                             pass
                     save_state()
                     tg_test()
-                    self._send_html(shell('تنظیمات', create_settings_html('تنظیمات تلگرام ذخیره شد')))
+                    self._send_html(shell('تنظیمات', create_settings_html('تنظیمات تلگرام ذخیره شد ✅')))
                     return
             self.send_response(302)
             self.send_header('Location', '/')
@@ -2697,6 +3112,62 @@ def run_selftest():
         return r is None or r['direction'] in ('long', 'short')
     T('سیگنال بک‌تست', t_bt)
 
+    def t_sanitize():
+        old = list(_SECRET_VALUES)
+        _SECRET_VALUES[:] = ['supersecretkey123']
+        out = mask_secrets('error with supersecretkey123 inside')
+        _SECRET_VALUES[:] = old
+        return out == 'error with [REDACTED] inside'
+    T('سنسوریزر: پنهان‌کردن کلید در لاگ', t_sanitize)
+
+    def t_sanitize_hex():
+        out = mask_secrets('key=0x' + 'ab' * 32)
+        return '[REDACTED_KEY]' in out
+    T('سنسوریزر: کلید ۶۴ بایتی', t_sanitize_hex)
+
+    def t_cache_bound():
+        globals()['_CANDLE_CACHE_MAX'] = 3
+        for i in range(6):
+            _candle_cache[('C' + str(i), '60', 30, False)] = (time.time(), [1.0])
+            _candle_cache.move_to_end(('C' + str(i), '60', 30, False))
+            while len(_candle_cache) > globals()['_CANDLE_CACHE_MAX']:
+                _candle_cache.popitem(last=False)
+        ok = len(_candle_cache) <= 3
+        _candle_cache.clear()
+        globals()['_CANDLE_CACHE_MAX'] = 150
+        return ok
+    T('کش کندل محدود (بدون نشتی حافظه)', t_cache_bound)
+
+    def t_bt_live_parity():
+        # THE critical regression: backtest signal must be IDENTICAL to live signal.
+        # Both must come from the same _score_signal() on the same candles.
+        import numpy as _np
+        # build a few different synthetic price shapes: downtrend, uptrend, chop
+        series = []
+        series.append([100 - i * 0.3 + _np.sin(i / 4) for i in range(40)])      # downtrend
+        series.append([100 + i * 0.3 + _np.sin(i / 4) for i in range(40)])      # uptrend
+        series.append([100 + _np.sin(i / 2) * 1.2 for i in range(40)])          # chop
+        series.append([100 - 2 * i for i in range(40)])                         # strong fall (knife)
+        ok = True
+        for s in series:
+            for i in range(24, 40):
+                core = _score_signal(s[:i + 1], 'BTC')
+                bt = _bt_entry_signal(s, None, i, 'BTC', 4, 0.02, 0.03)
+                if core['score'] >= 4 and core['rsi_anchor'] and core['direction']:
+                    if bt is None:
+                        ok = False
+                        break
+                    if bt['direction'] != core['direction'] or abs(bt['score'] - core['score']) > 1e-9:
+                        ok = False
+                        break
+                elif bt is not None:
+                    ok = False
+                    break
+            if not ok:
+                break
+        return ok
+    T('پریتی کامل: سیگنال بک‌تست == سیگنال لایو', t_bt_live_parity)
+
     failed = [t for t in tests if not t[1]]
     print(f"\n===== Self test: {len(tests) - len(failed)}/{len(tests)} passed =====")
     for name, ok, err in tests:
@@ -2730,12 +3201,38 @@ def main():
         state['mode'] = env_mode
     elif state.get('mode') not in ('paper', 'live'):
         state['mode'] = 'paper'
+
+    # ---- startup validation (issues #1, #2, #4) ----
     state['hl_account'] = hl_account()
-    state['hl_agent_ok'] = hl_exchange() is not None
+    state.setdefault('hl_block_reason', '')
+    if state['mode'] == 'live':
+        ok, info = hl_test_connection()
+        state['hl_agent_ok'] = ok
+        if ok:
+            add_log(f'LIVE validation OK: {info}')
+        else:
+            reason = state.get('hl_block_reason') or info
+            state['hl_block_reason'] = reason
+            add_log(f'⚠️ LIVE BLOCKED: {reason}')
+            print(f'  ⚠️  {reason}')
+            send_telegram(f'🚫 ربات در حالت لایو ولی معاملات واقعی قفل است:\n{reason}\n'
+                          f'حل: python3 setup_hyperliquid.py و تایید Agent در هایپرلیکوئید')
+            # keep bot running (paper engine always-on) but block live entries
+    else:
+        state['hl_agent_ok'] = hl_exchange() is not None
+        if not state['hl_agent_ok']:
+            add_log('Paper-only mode: run setup_hyperliquid.py to enable live trading later')
+    if not state.get('dash_pass') or state.get('dash_pass') == 'admin1234':
+        add_log('⚠️ DASH_PASS هنوز پیش‌فرضه (admin1234) - بهتره عوضش کنی')
     print('[2/4] Web server...')
     threading.Thread(target=start_server, daemon=True).start()
     print('[3/4] OK')
-    print(f'[3.5/4] Live engine: {"ready (keys found)" if state["hl_agent_ok"] else "paper-only (run setup_hyperliquid.py for live)"}')
+    if state['mode'] == 'live' and state.get('hl_agent_ok'):
+        print('[3.5/4] Live engine: ready ✅')
+    elif state['mode'] == 'live':
+        print(f'[3.5/4] Live engine: BLOCKED ⛔ {state.get("hl_block_reason")}')
+    else:
+        print('[3.5/4] Live engine: paper-only (run setup_hyperliquid.py for live)')
     print('[4/4] Bot loop... (Ctrl+C to stop)\n')
     bot_loop()
 
