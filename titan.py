@@ -52,17 +52,21 @@ def _trend(c, coin, c4=None):
     s50 = np.mean(a[-50:]) if len(a) >= 50 else s20
     s100 = np.mean(a[-100:]) if len(a) >= 100 else s20
     sc, dr = 0, None
+    c4_bonus = 0.0
+    # 4h confirmation bonus (computed BEFORE score so it isn't overwritten)
+    if c4 and len(c4) >= 10:
+        try:
+            c4_arr = np.array(c4[-10:], dtype=float)
+            if s20 > s50 and c4_arr[-1] > c4_arr[0]:
+                c4_bonus = 0.5
+            elif s20 < s50 and c4_arr[-1] < c4_arr[0]:
+                c4_bonus = 0.5
+        except Exception:
+            pass
     if s20 > s50:
-        # 4h confirmation bonus
-        if c4 and len(c4) >= 10:
-            c4_arr = np.array(c4[:10], dtype=float)
-            if c4_arr[-1] > c4_arr[0]: sc += 0.5
-        sc = min(5, (s20 - s100) / max(abs(s100), 1) * 1000); dr = 'long'
+        sc = min(5, (s20 - s100) / max(abs(s100), 1) * 1000) + c4_bonus; dr = 'long'
     elif s20 < s50:
-        if c4 and len(c4) >= 10:
-            c4_arr = np.array(c4[:10], dtype=float)
-            if c4_arr[-1] < c4_arr[0]: sc += 0.5
-        sc = min(5, abs(s20 - s100) / max(abs(s100), 1) * 1000); dr = 'short'
+        sc = min(5, abs(s20 - s100) / max(abs(s100), 1) * 1000) + c4_bonus; dr = 'short'
     
     if sc >= 3 and dr: return {'s': round(sc, 1), 'd': dr, 'st': 'trend', 'c': min(0.8, 0.3 + sc * 0.08)}
     return None
@@ -95,7 +99,10 @@ def titan_scan(gcc, coin, COIN_FA, regime=None, prefer=None):
     sigs = []
     for fn in sorted(_FNS, key=lambda f: 0 if prefer and str(f.__name__).replace('_','') == prefer else 1):
         try:
-            sig = fn(c, coin)
+            if fn.__name__ == '_trend':
+                sig = fn(c, coin, c4)
+            else:
+                sig = fn(c, coin)
             if sig:
                 _r = sig.get('regime', regime)
                 if _r in _BOOST.get(sig['st'], []): sig['s'] += 1

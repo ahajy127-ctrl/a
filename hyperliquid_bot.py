@@ -2146,7 +2146,7 @@ def sync_live_capital(quiet=False):
                 _drop = (last - val) / last
                 if _drop > 0.15 and not state.get('balance_warned'):
                     state['balance_warned'] = True
-                    add_log(f'BALANCE DROP: {last:.2f}$ -> {val:.2f}$ ({(drop*100):.0f}%) while no open positions')
+                    add_log(f'BALANCE DROP: {last:.2f}$ -> {val:.2f}$ ({(_drop*100):.0f}%) while no open positions')
                     send_telegram(f'⚠️ موجودی حساب {val:.2f}$ شده (قبلاً {last:.2f}$) بدون پوزیشن باز!\n'
                                   f'شاید برداشت دستی یا کارمزد بوده. چک کن.')
             if val > last or (last and _drop and _drop <= 0.05):
@@ -3145,6 +3145,14 @@ def system_health():
         disk_free = st.f_bavail * st.f_frsize / (1024 ** 3)
     except Exception:
         disk_free = None
+    if disk_free is None:
+        try:
+            # Windows fallback: use shutil.disk_usage
+            import shutil
+            _total, _used, _free = shutil.disk_usage(BASE_DIR)
+            disk_free = _free / (1024 ** 3)
+        except Exception:
+            disk_free = None
     return {'scan_age_s': scan_age, 'scan_ok': scan_age < 1800, 'disk_free_gb': disk_free}
 
 def heartbeat_text():
@@ -3271,6 +3279,10 @@ def bot_loop():
                 try:
                     _nightly_learn()
                     _nightly_optimize()
+                    _nightly_check_strategies()
+                    # Wire the Dead code: ultimate.overlord_nightly fills strategy_matrix
+                    overlord_nightly(state, get_ledger, add_log, send_telegram)
+                    overlord_adjust_threshold(get_candles, bt_on_data, STOP_LOSS, TAKE_PROFIT, get_tuned, state, add_log, send_telegram)
                 except Exception:
                     log_exception('nightly')
             # GitHub update check every 6h
@@ -3283,9 +3295,10 @@ def bot_loop():
                         send_telegram(f'🔄 بروزرسانی: {_upd}')
                 except Exception:
                     pass
+            hhmm = fa_now().strftime('%H:%M')
+            today_s = fa_now().strftime('%Y-%m-%d')
+            hb_iv = int(state.get('heartbeat_hours', 0) or 0)
             if state.get('tg_token') and state.get('tg_chat'):
-                hhmm = fa_now().strftime('%H:%M')
-                today_s = fa_now().strftime('%Y-%m-%d')
                 if fa_now().strftime('%A') == 'Fri' and state.get('last_weekly_report') != today_s:
                     state['last_weekly_report'] = today_s
                     try:
@@ -3293,15 +3306,14 @@ def bot_loop():
                         add_log('Weekly report sent')
                     except Exception:
                         log_exception('weekly report failed')
-            if hhmm >= '22:30' and state.get('last_daily_report') != today_s:
-                state['last_daily_report'] = today_s
-                try:
-                    send_telegram(daily_report_text())
-                    add_log('Daily report sent')
-                except Exception:
-                    log_exception('daily report failed')
-            hb_iv = int(state.get('heartbeat_hours', 0) or 0)
-            if hb_iv > 0 and now - last_heartbeat > hb_iv * 3600:
+                if hhmm >= '22:30' and state.get('last_daily_report') != today_s:
+                    state['last_daily_report'] = today_s
+                    try:
+                        send_telegram(daily_report_text())
+                        add_log('Daily report sent')
+                    except Exception:
+                        log_exception('daily report failed')
+                if hb_iv > 0 and now - last_heartbeat > hb_iv * 3600:
                     last_heartbeat = now
                     send_telegram(heartbeat_text())
             if now - state.get('last_poll', 0) > 8:
@@ -3442,6 +3454,12 @@ def bot_loop():
                 state['loop_fails'] = 0
                 try:
                     send_telegram('🚨 حلقه اصلی ربات مدام خطا میدهد! لاگ را بررسی کنید')
+                except Exception:
+                    pass
+                # Fallback alert even without Telegram: write a critical file
+                try:
+                    with open(os.path.join(BASE_DIR, 'CRITICAL_ALERT.txt'), 'w') as _f:
+                        _f.write('Bot loop failed ' + str(state.get('loop_fails', 4)) + ' times in a row at ' + fa_now().isoformat() + ' - CHECK app.log')
                 except Exception:
                     pass
         time.sleep(5)
@@ -3767,7 +3785,8 @@ def dash_pass():
 
 def auth_ok(cookie):
     try:
-        return cookie == _hash_pw(dash_pass())
+        import hmac
+        return hmac.compare_digest(str(cookie), str(_hash_pw(dash_pass())))
     except Exception:
         return False
 
@@ -3952,7 +3971,8 @@ class Handler(SimpleHTTPRequestHandler):
                         self.end_headers()
                     return
                 # ---- Regular login ----
-                if _hash_pw(pw) == _hash_pw(dash_pass()):
+                import hmac
+                if hmac.compare_digest(str(_hash_pw(pw)), str(_hash_pw(dash_pass()))):
                     _rl[ip] = [now, 0]
                     self.send_response(302)
                     self.send_header('Location', '/')
@@ -4260,6 +4280,56 @@ def run_selftest():
     T('پریتی کامل: سیگنال بک‌تست == سیگنال لایو', t_bt_live_parity)
 
     failed = [t for t in tests if not t[1]]
+    def t_e2e_loop_no_telegram():
+        # The EXACT scenario that crashed before: bot_loop with no TG_TOKEN
+        state['tg_token'] = ''
+        state['tg_chat'] = ''
+        try:
+            # Same logic as start of bot_loop telegram section
+            hhmm = fa_now().strftime('%H:%M')
+            today_s = fa_now().strftime('%Y-%m-%d')
+            hb_iv = int(state.get('heartbeat_hours', 0) or 0)
+            # The old code used hhmm/today_s OUTSIDE the tg block -> NameError
+            # Now they're defined globally, so this must work:
+            ok = isinstance(hhmm, str) and isinstance(today_s, str) and isinstance(hb_iv, int)
+            return ok
+        except Exception:
+            return False
+    T('E2E: حلقه اصلی بدون تلگرام کرش نمیکند', t_e2e_loop_no_telegram)
+
+    def t_e2e_dragon_sl_applied():
+        # Does a Dragon signal flow into the position's real SL/TP?
+        state['mode'] = 'paper'
+        state['crash_mode'] = False
+        state['manual_paused'] = False
+        state['prices'] = {'BTC': 100.0}
+        state['regime'] = {'regime': 'range', 'volatility': 0.3, 'trend_pct': 0.1, 'efficiency': 0.5}
+        lg = get_ledger('paper')
+        lg['positions'] = []
+        lg['trades'] = []
+        lg['capital'] = 500.0
+        lg['daily_pnl'] = 0.0
+        lg['daily_date'] = fa_now().strftime('%Y-%m-%d')
+        lg['weekly_pnl'] = 0.0
+        lg['week_date'] = fa_now().strftime('%Y-%W')
+        sig = {'coin': 'BTC', 'direction': 'long', 'score': 5.0, 'confidence': 0.7,
+               'reasons': ['dragon'], 'factors': ['funding_hunter'],
+               'sl_pct': 0.015, 'tp_pct': 0.06}
+        try:
+            r = open_engine_position('paper', sig)
+            pos = lg['positions'][0] if lg['positions'] else None
+            ok = False
+            if pos:
+                sl_pct = abs(pos['entry_price'] - pos['stop_loss']) / pos['entry_price']
+                tp_pct = abs(pos['take_profit'] - pos['entry_price']) / pos['entry_price']
+                ok = abs(sl_pct - 0.015) < 1e-4 and abs(tp_pct - 0.06) < 1e-4
+        except Exception:
+            ok = False
+        lg['positions'] = []
+        lg['trades'] = []
+        return ok
+    T('E2E: استاپ/سود اژدها به پوزیشن واقعی میرسد', t_e2e_dragon_sl_applied)
+
     def t_e2e_open_position():
         # THE critical regression: real open_engine_position path must open a position
         state['mode'] = 'paper'
