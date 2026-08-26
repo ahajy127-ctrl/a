@@ -83,7 +83,7 @@ def generate_agent():
         return acc.address, acc.key.hex()  # 0x-prefixed address, 0x key
     except Exception:
         print("❌ کتابخانه eth-account نصب نیست. در حال نصب...")
-        os.system(f'"{sys.executable}" -m pip install eth-account -q')
+        os.system(f'"{sys.executable}" -m pip install --break-system-packages eth-account -q')
         from eth_account import Account
         acc = Account.create()
         return acc.address, acc.key.hex()

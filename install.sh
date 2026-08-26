@@ -24,8 +24,8 @@ fi
 
 # 2) pip packages
 echo "[1/3] نصب کتابخانه‌های پایتون..."
-python3 -m pip install --upgrade pip -q
-python3 -m pip install -r requirements.txt -q
+python3 -m pip install --break-system-packages --upgrade pip -q
+python3 -m pip install --break-system-packages -r requirements.txt -q
 echo "     ✅ کتابخانه‌ها نصب شد"
 
 # 3) .env file
