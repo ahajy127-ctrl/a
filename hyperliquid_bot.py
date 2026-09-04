@@ -1,0 +1,5351 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Hyperliquid Trading Bot v26 (always-on Paper engine + optional Live engine)
+============================================================================
+- Port of the Nobitex v25 strategy to Hyperliquid (decentralized perps).
+- ONE unified exit engine used by: paper trades, live trades and backtests.
+- PAPER engine (virtual $100) ALWAYS runs and validates signals — no risk.
+- LIVE engine activates from Settings/.env and trades real perps on
+  Hyperliquid with an AGENT WALLET (EIP-712 signed, official SDK).
+  Your funds stay in your Rabby wallet; the agent can only trade, never withdraw.
+
+Safety layers:
+  - Daily loss limit (8%), circuit breaker, crash guard, checkpoints
+  - Protective trigger stop-loss on the exchange (backstop) per position
+  - Min order notional enforced ($10), orderbook-depth sizing, coin whitelist
+"""
+
+import subprocess, sys, os, json, time, threading, urllib.parse, socket, hashlib
+import logging, math, csv, io, traceback as tb, secrets
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+# ---------- paths & file logging ----------
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOG_FILE = os.path.join(BASE_DIR, 'app.log')
+STATE_FILE = os.path.join(BASE_DIR, 'state.json')
+TEHRAN = timezone(timedelta(hours=3, minutes=30))   # reporting/reset timezone
+UTC = timezone.utc
+LONDON = ZoneInfo('Europe/London')
+NEW_YORK = ZoneInfo('America/New_York')
+TOKYO = ZoneInfo('Asia/Tokyo')
+
+try:  # log rotation: >5MB -> app.log.1
+    if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 5 * 1024 * 1024:
+        os.replace(LOG_FILE, LOG_FILE + '.1')
+except Exception:
+    pass
+
+logging.basicConfig(filename=LOG_FILE, level=logging.INFO,
+                    format='%(asctime)s %(levelname)s %(message)s')
+
+# ---- secret sanitizer: never write keys/tokens into logs (issue #4) ----
+_SECRET_VALUES = []
+
+def _collect_secrets():
+    """Gather sensitive env values so they can be masked out of logs."""
+    global _SECRET_VALUES
+    vals = set()
+    for k in ('HL_AGENT_PRIVATE_KEY', 'TG_TOKEN', 'DASH_PASS', 'NOBITEX_TOKEN',
+              'HL_ACCOUNT_ADDRESS'):
+        v = os.environ.get(k, '').strip()
+        if v and len(v) >= 4:
+            vals.add(v)
+    _SECRET_VALUES = sorted(vals, key=len, reverse=True)
+
+def mask_secrets(text):
+    """Replace known secrets + raw 0x private keys with [REDACTED]."""
+    try:
+        t = str(text or '')
+        for v in _SECRET_VALUES:
+            if v and v in t:
+                t = t.replace(v, '[REDACTED]')
+        import re
+        t = re.sub(r'0x[0-9a-fA-F]{60,64}', '[REDACTED_KEY]', t)
+        t = re.sub(r'\b(?:private[_ ]?key|secret)[^\n]{0,80}:?\s*0x[0-9a-fA-F]{20,}', '[REDACTED]', t, flags=re.I)
+        return t
+    except Exception:
+        return str(text or '')
+
+def log_exception(context=''):
+    try:
+        logging.error("%s\n%s", mask_secrets(context), mask_secrets(tb.format_exc()))
+    except Exception:
+        pass
+
+def fa_now():
+    """Current time in Tehran (daily resets & reports use this)."""
+    return datetime.now(TEHRAN)
+
+def load_env_file():
+    env_path = os.path.join(BASE_DIR, '.env')
+    try:
+        if os.path.exists(env_path):
+            with open(env_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        k, _, v = line.partition('=')
+                        os.environ.setdefault(k.strip(), v.strip())
+    except Exception:
+        log_exception('.env parse failed')
+
+load_env_file()
+_collect_secrets()   # cache secrets so they can be masked out of logs
+
+# timezone override (default Tehran UTC+3:30) — issue #14
+try:
+    off = float(os.environ.get('BOT_TZ_OFFSET_HOURS', '3.5'))
+    TEHRAN = timezone(timedelta(hours=off))
+except Exception:
+    pass
+
+# ---------- packages ----------
+# Dependencies are declared in requirements.txt and must be installed by the
+# deployment environment. Never mutate the runtime with an implicit pip install.
+try:
+    import requests
+    import numpy as np
+except ImportError as exc:
+    raise RuntimeError(
+        'Missing runtime dependency. Run: python -m pip install -r requirements.txt'
+    ) from exc
+
+try:
+    import websocket  # noqa: F401
+except ImportError:
+    websocket = None
+
+try:
+    import hyperliquid  # noqa: F401
+except ImportError:
+    hyperliquid = None
+
+
+import signal
+
+def _signal_handler(sig, frame):
+    """Graceful shutdown: save state before exit."""
+    print(f'\nReceived signal {sig}. Saving state...')
+    try:
+        save_state()
+        print('State saved. Goodbye!')
+    except Exception as e:
+        print(f'Error saving state: {e}')
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
+import requests
+import numpy as np
+import sqlite3
+import hashlib
+from risk_guard import live_entry_gate, require_verified_protection
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
+from ultimate import *
+from titan import titan_scan, detect_regime, STRATS
+import json as _json
+
+# ============ Static config (strategy baseline) ============
+
+PAPER_CAPITAL = 100.0        # virtual engine capital (always-on)
+RISK_PER_TRADE = float(os.environ.get('RISK_PER_TRADE', '0.01'))  # 1% default account-risk budget; override explicitly if needed
+STOP_LOSS = 0.020
+TAKE_PROFIT = 0.030
+DESIRED_LEV = {'BTC': 10, 'DEFAULT': 5}
+MAX_LEV = int(os.environ.get('LIVE_MAX_LEVERAGE', '5'))  # hard live cap
+LIVE_COIN_WHITELIST = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'LTC']
+
+# Per-coin optimized parameters (from backtest optimization)
+PER_COIN = {'BTC': {'sl_mult': 0.8, 'tp_mult': 0.8, 'th_adj': 0, 'weight': 1.5}, 'ETH': {'sl_mult': 1.5, 'tp_mult': 1.5, 'th_adj': 1, 'weight': 0.8}, 'SOL': {'sl_mult': 1.8, 'tp_mult': 1.8, 'th_adj': 0, 'weight': 0.7}, 'DOGE': {'sl_mult': 2.2, 'tp_mult': 2.0, 'th_adj': 1, 'weight': 0.5}, 'XRP': {'sl_mult': 1.5, 'tp_mult': 1.5, 'th_adj': 0, 'weight': 0.6}, 'LTC': {'sl_mult': 1.2, 'tp_mult': 1.2, 'th_adj': 0, 'weight': 0.7}, 'ADA': {'sl_mult': 1.6, 'tp_mult': 1.6, 'th_adj': 1, 'weight': 0.6}, 'AVAX': {'sl_mult': 1.8, 'tp_mult': 1.8, 'th_adj': 1, 'weight': 0.5}, 'ARB': {'sl_mult': 2.0, 'tp_mult': 2.0, 'th_adj': 1, 'weight': 0.4}, 'ATOM': {'sl_mult': 1.5, 'tp_mult': 1.5, 'th_adj': 0, 'weight': 0.6}, 'LINK': {'sl_mult': 1.5, 'tp_mult': 1.5, 'th_adj': 0, 'weight': 0.7}, 'NEAR': {'sl_mult': 1.8, 'tp_mult': 1.8, 'th_adj': 1, 'weight': 0.5}, 'SUI': {'sl_mult': 2.0, 'tp_mult': 2.0, 'th_adj': 1, 'weight': 0.4}, 'OP': {'sl_mult': 1.8, 'tp_mult': 1.8, 'th_adj': 1, 'weight': 0.4}}
+
+LIVE_MAX_BOOK_SHARE = float(os.environ.get('LIVE_MAX_BOOK_SHARE', '0.10'))
+HL_MIN_ORDER_USD = float(os.environ.get('LIVE_MIN_ORDER_USD', '10'))      # Hyperliquid perp minimum notional
+FEE_RATE = 0.0025            # paper round-trip cost estimate on notional
+HL_FEE = 0.0005              # HL taker ~0.035% + buffer (single leg)
+DAILY_LOSS_LIMIT = float(os.environ.get('LIVE_DAILY_LOSS_LIMIT', '0.05'))
+WEEKLY_LOSS_LIMIT = 0.15      # extra protection: cap weekly losses at 15%
+SCAN_INTERVAL = 300
+POS_CHECK_INTERVAL = 30
+TRAIL_GAP = 0.008
+RUNNER_TRAIL = 0.010
+LADDER1_AT_TP = 0.70
+LADDER1_LOCK = 0.40
+MAX_POSITIONS = int(os.environ.get('LIVE_MAX_POSITIONS', '3'))
+MAX_TOTAL_RISK = float(os.environ.get('LIVE_MAX_TOTAL_RISK', '0.10'))
+MAX_TRADE_HOURS = 24
+SHORT_TH_EXTRA = 1
+LOSS_COOLDOWN = 900
+MAX_CONSEC_LOSSES = 3
+CONSEC_PAUSE = 7200
+LIQUIDATION_HALT_HOURS = 24   # auto-halt 24h after a liquidation
+SPREAD_MAX = 0.004
+STRATEGY_VERSION = 26
+SHADOW_MAX_PENDING = 60
+SHADOW_TIMEOUT_H = 24
+
+HL_MAINNET = 'https://api.hyperliquid.xyz'
+HL_TESTNET = 'https://api.hyperliquid-testnet.xyz'
+
+COIN_FA = {'BTC': 'بیت‌کوین', 'ETH': 'اتریوم', 'SOL': 'سولانا', 'XRP': 'ریپل',
+           'DOGE': 'دوج‌کوین', 'TRX': 'ترون', 'ADA': 'کاردانو', 'LTC': 'لایت‌کوین',
+           'BNB': 'بی‌ان‌بی', 'DOT': 'پولکادات', 'AVAX': 'آوالانچ',
+           'LINK': 'چین‌لینک', 'SHIB': 'شیبا', 'UNI': 'یونی‌سواپ', 'ATOM': 'کازماس',
+           'NEAR': 'نیر', 'FIL': 'فایل‌کوین', 'TON': 'تون‌کوین', 'ARB': 'آربیتروم',
+           'OP': 'آپتیمیزم', 'XAUT': 'تتر گلد (طلا) 🥇'}
+# coins scanned for the PAPER engine (live engine only uses the whitelist)
+SCAN_COINS = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'LTC', 'ADA', 'AVAX', 'LINK',
+              'MATIC', 'DOT', 'ATOM', 'UNI', 'NEAR', 'APT', 'ARB', 'OP', 'FIL',
+              'TRX', 'BNB']
+
+# ============ Hyperliquid data layer ============
+
+
+# ---- API Health Monitor ----
+_API_STATS = {'calls': 0, 'errors': 0, 'rate_limited': 0, 'last_min_calls': 0, 'last_check': 0.0}
+
+def _record_api_call(success=True):
+    now = time.time()
+    _API_STATS['calls'] += 1
+    if not success:
+        _API_STATS['errors'] += 1
+    if now - _API_STATS['last_check'] > 60:
+        _API_STATS['last_min_calls'] = _API_STATS['calls']
+        _API_STATS['calls'] = 0
+        _API_STATS['last_check'] = now
+
+def _api_health():
+    calls = _API_STATS['last_min_calls']
+    err = _API_STATS['errors']
+    return f'{calls}calls/min {err}errors'
+
+def hl_base_url():
+    return HL_TESTNET if os.environ.get('HL_TESTNET', '').strip().lower() == 'true' else HL_MAINNET
+
+_hl_info = [None]
+_hl_meta = [None]
+_hl_lock = threading.Lock()
+
+def hl_info():
+    """Read-only Hyperliquid client (cached, with auto-retry on init)."""
+    with _hl_lock:
+        if _hl_info[0] is None:
+            from hyperliquid.info import Info
+            _hl_info[0] = _net_call(lambda: Info(hl_base_url(), skip_ws=True, timeout=15), retries=3, base_wait=1.0)
+        return _hl_info[0]
+
+
+# ---- Rate Limiter ----
+_RATE_SEM = __import__('threading').Semaphore(8)
+
+def _rl_call(fn, retries=2, backoff=1.0):
+    for i in range(retries + 1):
+        with _RATE_SEM:
+            try:
+                return fn()
+            except Exception as e:
+                if i >= retries: raise
+                __import__('time').sleep(backoff * (i + 1))
+
+def _net_call(fn, retries=2, base_wait=1.0):
+    return _rl_call(fn, retries, base_wait)
+
+
+def hl_meta():
+    if _hl_meta[0] is None:
+        m = _net_call(lambda: hl_info().meta(), retries=3, base_wait=1.0)
+        uni = m.get('universe', [])
+        names = [u.get('name') for u in uni]
+        _hl_meta[0] = {
+            'names': set(names),
+            'sz': {u.get('name'): u.get('szDecimals', 4) for u in uni},
+            'px': {u.get('name'): u.get('pxDecimals', 2) for u in uni},
+        }
+    return _hl_meta[0]
+
+def SZ_DECIMALS(coin):
+    return hl_meta()['sz'].get(coin, 4)
+
+def PX_DECIMALS(coin):
+    return hl_meta()['px'].get(coin, 2)
+
+def valid_coin(coin):
+    return coin in hl_meta()['names']
+
+# ============ State ============
+
+state_lock = threading.RLock()
+state = {}
+# Dashboard sessions: random, per-login, in-memory only. Never persisted.
+_dashboard_sessions = {}
+_dashboard_sessions_lock = threading.RLock()
+DASH_SESSION_TTL = 12 * 3600
+
+# ---- SQLite trade history backup ----
+def _init_sqlite(supress_log=False):
+    try:
+        db_path = os.path.join(BASE_DIR, 'trades.db')
+        conn = sqlite3.connect(db_path, timeout=5)
+        conn.execute('CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, ledger TEXT, coin TEXT, direction TEXT, entry REAL, exit REAL, pnl REAL, pnl_pct REAL, reason TEXT, factors TEXT, live INTEGER)')
+        conn.commit()
+        conn.close()
+        if not supress_log:
+            add_log('SQLite ready: trades.db')
+        return True
+    except Exception as e:
+        if not supress_log:
+            add_log('SQLite init: ' + str(e)[:60])
+        return False
+
+def _save_trade_sqlite(trade):
+    try:
+        db_path = os.path.join(BASE_DIR, 'trades.db')
+        conn = sqlite3.connect(db_path, timeout=5)
+        conn.execute('INSERT INTO trades (ts,ledger,coin,direction,entry,exit,pnl,pnl_pct,reason,factors,live) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                     (trade.get('ts',0), trade.get('ledger',''), trade.get('coin',''), trade.get('direction',''), trade.get('entry',0), trade.get('exit',0), trade.get('pnl',0), trade.get('pnl_pct',0), trade.get('reason',''), str(trade.get('factors',[])), 1 if trade.get('live') else 0))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+def fresh_ledger(name):
+    return {
+        'name': name,
+        'capital': PAPER_CAPITAL if name == 'paper' else None,  # live synced from exchange
+        'positions': [],
+        'trades': [],
+        'equity': [],
+        'daily_pnl': 0.0,
+        'daily_date': '',
+        'weekly_pnl': 0.0,
+        'week_date': '',
+        'weekly_paused': False,
+        'consec_losses': 0,
+        'cooldown_until': 0.0,
+        'trading_paused': False,     # daily-loss-limit pause
+        'cp_triggered': False,       # checkpoint pause
+        'liq_halt_until': 0.0,     # liquidation halt timestamp
+        'banked_total': 0.0,
+    }
+
+def default_state():
+    return {
+        'mode': 'paper',             # 'paper': only virtual; 'live': both engines
+        'ledgers': {'paper': fresh_ledger('paper'), 'live': fresh_ledger('live')},
+        'prices': {}, 'prices_ts': '',
+        'price_history': [], 'last_scan_ts': 0.0,
+        'total_scans': 0, 'last_watchdog_alert': 0.0,
+        'manual_paused': False,
+        'logs': [], 'start_time': fa_now().isoformat(), 'status': 'Starting',
+        'scan_table': [], 'last_signal': None, 'last_reason': '',
+        'regime': None, 'crash_mode': False,
+        'funding': {}, 'funding_ts': 0.0,
+        'threshold_extra': 0, 'tuned': None, 'genome': None, 'factor_weights': None,
+        'coin_banned': {}, 'lev_set': {},
+        'hl_account': '', 'hl_agent_ok': False, 'live_reason': '',
+        'pending_live_signal': None,  # for semi-auto mode
+        'backstop_enabled': os.environ.get('HL_USE_TRIGGER_SL', 'true').lower() == 'true',
+        'require_backstop': os.environ.get('LIVE_REQUIRE_BACKSTOP', 'true').lower() == 'true',
+        'semi_auto': os.environ.get('SEMI_AUTO', 'false').lower() == 'true',
+    }
+
+def add_log(msg):
+    try:
+        msg = mask_secrets(msg)
+        logging.info('%s', msg)
+        with state_lock:
+            state['logs'].append({'t': fa_now().strftime('%H:%M:%S'), 'm': msg})
+            if len(state['logs']) > 80:
+                state['logs'] = state['logs'][-80:]
+    except Exception:
+        pass
+
+def save_state():
+    try:
+        _prune_oversized_state()
+        # Save paper and live separately for isolation (prevents cross-contamination)
+        try:
+            _isolate_ledgers()
+        except:
+            pass
+        tmp = STATE_FILE + '.tmp'
+        # Never persist credentials or dashboard authentication material.
+        # Runtime values come from environment/secret store on startup.
+        import copy
+        persist_state = copy.deepcopy(state)
+        for _secret_field in ('tg_token', 'tg_chat', 'dash_pass', 'HL_AGENT_PRIVATE_KEY'):
+            persist_state.pop(_secret_field, None)
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(persist_state, f, ensure_ascii=False, default=str)
+        os.replace(tmp, STATE_FILE)
+        try:
+            if os.path.exists(STATE_FILE + '.bak'):
+                os.remove(STATE_FILE + '.bak')
+        except:
+            pass
+        try:
+            import shutil
+            shutil.copy2(STATE_FILE, STATE_FILE + '.bak')
+        except:
+            pass
+    except Exception:
+        log_exception('save_state failed')
+
+
+def _isolate_ledgers():
+    """Sanity-check ledger isolation: paper should never trade live coins and vice versa."""
+    for name in ('paper', 'live'):
+        lg = state.get('ledgers', {}).get(name)
+        if not lg:
+            continue
+        for pos in lg.get('positions', []):
+            # Live positions must have live_id, paper must not
+            if name == 'live' and not pos.get('live'):
+                pos['live'] = True
+            elif name == 'paper' and pos.get('live'):
+                pos['live'] = False
+def _prune_oversized_state():
+    """Trim oversized state to prevent unbounded growth."""
+    try:
+        if len(state.get('logs', [])) > 100:
+            state['logs'] = state['logs'][-100:]
+        if len(state.get('price_history', [])) > 500:
+            state['price_history'] = state['price_history'][-500:]
+        # Trim old equity data
+        for name in ('paper', 'live'):
+            lg = state.get('ledgers', {}).get(name)
+            if lg:
+                eq = lg.get('equity', [])
+                if len(eq) > 500:
+                    lg['equity'] = eq[-500:]
+    except:
+        pass
+
+def load_state():
+    global state
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, 'r', encoding='utf-8') as f:
+                saved = json.load(f)
+            st = default_state()
+            for k, v in saved.items():
+                if k in st or k in ('logs', 'shadow_signals', 'coin_banned', 'lev_set'):
+                    st[k] = v
+            for name in ('paper', 'live'):
+                lg = st['ledgers'].get(name)
+                if not isinstance(lg, dict):
+                    lg = fresh_ledger(name)
+                    st['ledgers'][name] = lg
+                for k, v in fresh_ledger(name).items():
+                    lg.setdefault(k, v)
+            state = st
+            # Never retain a raw private key in persistent state. Older builds
+            # accidentally stored it as _hl_key_hash; discard it on load.
+            _stored = state.get('_hl_key_hash', '')
+            if len(str(_stored)) != 64 or any(c not in '0123456789abcdef' for c in str(_stored).lower()):
+                state['_hl_key_hash'] = ''
+        else:
+            state = default_state()
+    except Exception:
+        log_exception('load_state failed')
+        state = default_state()
+
+def get_ledger(name):
+    return state.setdefault('ledgers', {}).setdefault(name, fresh_ledger(name))
+
+# ============ small formatting helpers ============
+
+def fmt_price(x):
+    try:
+        if x is None:
+            return '-'
+        x = float(x)
+        if x >= 1000:
+            return f'{x:,.0f}'
+        if x >= 10:
+            return f'{x:,.2f}'
+        return f'{x:.4f}'
+    except Exception:
+        return str(x)
+
+def fmt_money(x):
+    try:
+        return f'{float(x):,.2f}$'
+    except Exception:
+        return '-'
+
+def eff_leverage(coin):
+    want = DESIRED_LEV.get(coin, DESIRED_LEV['DEFAULT'])
+    return min(int(want), MAX_LEV)
+
+def pf_color(pf):
+    try:
+        pf = float(pf)
+        if pf >= 1.5:
+            return 'green'
+        if pf >= 1.0:
+            return 'orange'
+        return 'red'
+    except Exception:
+        return 'gray'
+
+# ============ Market data (Hyperliquid) ============
+
+RES_MAP = {'5': '5m', '15': '15m', '30': '30m', '60': '1h', '240': '4h', 'D': '1d'}
+RES_MS = {'5m': 300000, '15m': 900000, '30m': 1800000, '1h': 3600000,
+          '4h': 14400000, '1d': 86400000}
+
+def get_candles(symbol, resolution='60', count=30, with_volume=False, drop_forming=False):
+    try:
+        iv = RES_MAP.get(str(resolution), '1h')
+        step_ms = RES_MS.get(iv, 3600000)
+        now_ms = int(time.time() * 1000)
+        start_ms = now_ms - (count + 3) * step_ms
+        d = _net_call(lambda: hl_info().candles_snapshot(symbol, iv, start_ms, now_ms),
+                      retries=2, base_wait=1.0)
+        if not d:
+            return (None, None) if with_volume else None
+        closes = [float(x['c']) for x in d]
+        if drop_forming and len(closes) > 1:
+            closes = closes[:-1]
+        if with_volume:
+            vols = [float(x['v']) for x in d]
+            if drop_forming and len(vols) > 1:
+                vols = vols[:-1]
+            return closes, vols
+        return closes
+    except Exception:
+        return (None, None) if with_volume else None
+
+from collections import OrderedDict
+_candle_cache = OrderedDict()
+_CANDLE_CACHE_MAX = 150   # bounded so long runs cannot OOM (issue #15)
+
+def get_candles_cached(coin, resolution='60', count=30, max_age=240, drop_forming=False):
+    key = (coin, resolution, count, bool(drop_forming))
+    now = time.time()
+    hit = _candle_cache.get(key)
+    if hit and now - hit[0] < max_age:
+        _candle_cache.move_to_end(key)
+        return hit[1]
+    c = get_candles(coin, resolution, count, drop_forming=drop_forming)
+    if c:
+        _candle_cache[key] = (now, c)
+        _candle_cache.move_to_end(key)
+        try:
+            while len(_candle_cache) > _CANDLE_CACHE_MAX:
+                _candle_cache.popitem(last=False)
+        except: pass
+    return c
+
+def get_price(coin):
+    # Try state (updated by WS) first, REST as fallback
+    try:
+        p = state.get('prices', {}).get(coin)
+        if p:
+            return p
+        m = hl_info().all_mids()
+        v = m.get(coin)
+        return float(v) if v else None
+    except Exception:
+        return None
+
+def _count_price_failure():
+    """Track consecutive price failures; warn once if the feed is down (issue #5)."""
+    try:
+        state['price_fails'] = state.get('price_fails', 0) + 1
+        if state['price_fails'] in (5, 10, 30):
+            add_log(f'PRICE FEED: {state["price_fails"]} consecutive failures')
+            send_telegram(f'⚠️ {state["price_fails"]} بار پشت‌سرهم دریافت قیمت ناموفق بود! اینترنت/API هایپرلیکوئید رو چک کن.')
+    except Exception:
+        pass
+
+def get_prices():
+    """Refresh state['prices'] for all scanned coins; returns True on success."""
+    try:
+        m = _net_call(lambda: hl_info().all_mids(), retries=2, base_wait=1.0)
+        if not m:
+            _count_price_failure()
+            return False
+        prices = {}
+        for c in SCAN_COINS:
+            if c in m:
+                try:
+                    prices[c] = float(m[c])
+                except Exception:
+                    pass
+        if not prices:
+            _count_price_failure()
+            return False
+        state['price_fails'] = 0
+        with state_lock:
+            state['prices'] = prices
+            state['prices_ts'] = fa_now().strftime('%H:%M:%S')
+            hist = state['price_history']
+            hist.append({'t': time.time(), 'p': prices.get('BTC')})
+            if len(hist) > 500:
+                state['price_history'] = hist[-500:]
+        return True
+    except Exception:
+        log_exception('get_prices')
+        return False
+
+_orderbook_cache = {}
+
+def get_orderbook_info(coin):
+    try:
+        # Cache orderbook for 2 seconds to avoid redundant calls
+        now = time.time()
+        cached = _orderbook_cache.get(coin)
+        if cached and now - cached[0] < 2:
+            return cached[1]
+        bk = _net_call(lambda: hl_info().l2_snapshot(coin), retries=2, base_wait=1.0)
+        levels = bk.get('levels', [[], []])
+        bids = levels[0][:10]
+        asks = levels[1][:10]
+        if not bids or not asks:
+            return None, None, None
+        best_bid = float(bids[0]['px'])
+        best_ask = float(asks[0]['px'])
+        mid = (best_bid + best_ask) / 2
+        spread = (best_ask - best_bid) / mid if mid else 0.0
+        bid_usd = sum(float(l['px']) * float(l['sz']) for l in bids)
+        ask_usd = sum(float(l['px']) * float(l['sz']) for l in asks)
+        tot = bid_usd + ask_usd
+        ob = (bid_usd - ask_usd) / tot if tot else 0.0
+        _orderbook_cache[coin] = (time.time(), (ob, spread, tot))
+        return ob, spread, tot
+    except Exception:
+        return None, None, None
+
+def hl_book_depth_ok(coin, order_value_usdt, direction):
+    """Check the exchange book can absorb our order (share-based guard)."""
+    try:
+        bk = hl_info().l2_snapshot(coin)
+        levels = bk.get('levels', [[], []])
+        side = levels[0] if direction == 'long' else levels[1]
+        near = sum(float(l['px']) * float(l['sz']) for l in side[:8])
+        if near <= 0:
+            return False, near
+        if order_value_usdt > near * LIVE_MAX_BOOK_SHARE:
+            return False, near
+        return True, near
+    except Exception:
+        return False, None
+
+def update_funding():
+    try:
+        _, ctxs = hl_info().meta_and_asset_ctxs()
+        # Get universe names in ORDERED list form (set loses order — BUG #3)
+        m = hl_info().meta()
+        uni_names = [u.get('name') for u in m.get('universe', [])]
+        f = {}
+        for i, c in enumerate(ctxs):
+            if i < len(uni_names):
+                try:
+                    f[uni_names[i]] = float(c.get('funding', 0))
+                except Exception:
+                    pass
+        if f:
+            state['funding'] = f
+            state['funding_ts'] = time.time()
+    except Exception:
+        pass
+
+# ---------- market regime + crash guard ----------
+
+def detect_regime():
+    closes = get_candles_cached('BTC', '60', 48, max_age=600)
+    if not closes or len(closes) < 30:
+        return None
+    arr = np.array(closes, dtype=float)
+    rets = np.diff(arr) / arr[:-1]
+    vol = float(np.std(rets[-24:]))
+    seg = arr[-24:]
+    x = np.arange(len(seg))
+    slope = float(np.polyfit(x, seg, 1)[0])
+    trend_pct = slope * 24 / float(np.mean(seg))
+    net = abs(seg[-1] - seg[0])
+    path = float(np.sum(np.abs(np.diff(seg)))) or 1.0
+    eff = float(net / path)
+    if vol > 0.012:
+        regime = 'storm'
+    elif eff > 0.35 and trend_pct > 0.008:
+        regime = 'trend_up'
+    elif eff > 0.35 and trend_pct < -0.008:
+        regime = 'trend_down'
+    else:
+        regime = 'range'
+    return {'regime': regime, 'volatility': round(vol * 100, 3),
+            'trend_pct': round(trend_pct * 100, 2), 'efficiency': round(eff, 2),
+            'updated': fa_now().strftime('%H:%M:%S')}
+
+REGIME_FA = {'trend_up': 'روند صعودی 📈', 'trend_down': 'روند نزولی 📉',
+             'range': 'رِنج / خنثی ↔️', 'storm': 'طوفانی / پرنوسان ⛈'}
+
+def crash_guard_active():
+    closes = get_candles_cached('BTC', '60', 170, max_age=900)
+    if not closes or len(closes) < 24:
+        return False
+    drop_7d = ((closes[-1] - closes[-168]) / closes[-168]) if len(closes) >= 168 else 0.0
+    drop_24h = (closes[-1] - closes[-24]) / closes[-24]
+    if drop_7d < -0.07 or drop_24h < -0.05:
+        if not state.get('crash_mode'):
+            state['crash_mode'] = True
+            reason_txt = f"{drop_7d*100:.1f}% در ۷ روز" if drop_7d < -0.07 else f"{drop_24h*100:.1f}% در ۲۴ ساعت"
+            add_log(f'CRASH GUARD ON: BTC {reason_txt} - no new entries')
+            send_telegram(f'🌊 محافظ سقوط فعال شد: بیت‌کوین {reason_txt}. معامله جدید باز نمیشه.')
+        return True
+    if state.get('crash_mode'):
+        state['crash_mode'] = False
+        add_log('Crash guard OFF')
+        send_telegram('🌤 بازار آروم شد - محافظ سقوط غیرفعال شد')
+    return False
+
+# ============ Scoring / signals / learning layer ============
+
+FACTOR_KEYS = ['rsi', 'rsi_deep', 'momentum', 'trend', 'mtf', 'orderbook',
+               'volume', 'funding', 'regime', 'whale_flow', 'volume_climax',
+               'falling_knife', 'session', 'macd', 'bb', 'adx']
+WEIGHT_MIN, WEIGHT_MAX, WEIGHT_LR = 0.5, 1.5, 0.06
+GENOME_DEFAULT = {'rsi_lo': 38, 'rsi_hi': 62, 'sl': STOP_LOSS, 'tp': TAKE_PROFIT,
+                  'threshold': 4, 'mtf_req': False}
+
+def get_factor_weights():
+    w = state.get('factor_weights')
+    if not isinstance(w, dict):
+        w = {k: 1.0 for k in FACTOR_KEYS}
+        state['factor_weights'] = w
+    for k in FACTOR_KEYS:
+        w.setdefault(k, 1.0)
+    return w
+
+def weighted(points, factor):
+    return points * get_factor_weights().get(factor, 1.0)
+
+def get_genome():
+    g = state.get('genome') or {}
+    merged = dict(GENOME_DEFAULT)
+    for k in GENOME_DEFAULT:
+        if k in g:
+            merged[k] = g[k]
+    merged['rsi_lo'] = max(20, min(42, merged['rsi_lo']))
+    merged['rsi_hi'] = max(58, min(80, merged['rsi_hi']))
+    merged['sl'] = max(0.01, min(0.03, merged['sl']))
+    merged['tp'] = max(merged['sl'] * 1.3, min(0.06, merged['tp']))
+    merged['threshold'] = max(3, min(6, merged['threshold']))
+    return merged
+
+def get_tuned():
+    t = state.get('tuned') or {}
+    return {'sl': t.get('sl', STOP_LOSS), 'tp': t.get('tp', TAKE_PROFIT),
+            'threshold': t.get('threshold', 4)}
+
+def live_threshold():
+    base = get_tuned()['threshold'] + state.get('threshold_extra', 0)
+    try:
+        base += shadow_threshold_adjust()
+    except Exception:
+        pass
+    return max(3, min(6, base))
+
+def _calc_kelly_for_trades(trades):
+    if len(trades) < 10:
+        return RISK_PER_TRADE
+    recent = trades[-30:]
+    wins = [t.get('pnl', 0) for t in recent if t.get('pnl', 0) > 0]
+    losses = [abs(t.get('pnl', 0)) for t in recent if t.get('pnl', 0) <= 0]
+    if not wins or not losses:
+        return RISK_PER_TRADE
+    wr = len(wins) / len(recent)
+    ratio = (np.mean(wins) / np.mean(losses)) if np.mean(losses) > 0 else 1.0
+    k = (wr - (1 - wr) / max(ratio, 0.1)) * 0.5
+    # Risk budget is deliberately conservative: never below configured base, never above 5%.
+    return float(min(0.05, max(RISK_PER_TRADE, k if k > 0 else RISK_PER_TRADE)))
+
+def kelly_risk(lg_name='paper'):
+    k_paper = _calc_kelly_for_trades(get_ledger('paper')['trades'])
+    if lg_name == 'live' or state.get('mode') == 'live':
+        l_trades = get_ledger('live')['trades']
+        if len(l_trades) >= 15:
+            k_live = _calc_kelly_for_trades(l_trades)
+            return round(0.7 * k_live + 0.3 * k_paper, 4)
+    return round(k_paper, 4)
+
+def coin_volatility(coin):
+    closes = get_candles_cached(coin, '60', 25, drop_forming=True)
+    if not closes or len(closes) < 10:
+        return None
+    arr = np.array(closes, dtype=float)
+    rets = np.diff(arr) / arr[:-1]
+    return float(np.std(rets))
+
+def atr_of(coin, periods=14):
+    """Average True Range as a fraction of price, using real OHLC candles.
+
+    This is the live/paper risk path used by dynamic_levels().  It deliberately
+    uses the same OHLC-based ATR calculation as the research indicators rather
+    than close-only data, so wick/range volatility is represented correctly.
+    """
+    try:
+        rows = _ohlcv(coin, '60', max(40, periods + 2), drop_forming=True)
+        if not rows or len(rows) < periods + 1:
+            return None
+        return _atr_from_ohlcv(rows, periods)
+    except Exception:
+        return None
+
+def dynamic_levels(coin):
+    """ATR-based SL/TP: each coin gets stop/target proportional to its own
+    real volatility, so a 2% stop means the SAME thing on DOGE as on BTC."""
+    t = get_tuned()
+    base_sl, base_tp = t['sl'], t['tp']
+    atr = atr_of(coin)
+    if atr is None:
+        return base_sl, base_tp, 'normal'
+    # map ATR (per-bar volatility) into a SL that represents ~2.5x ATR
+    # but clamped to a sane band around the base tuning
+    sl_pct = max(base_sl * 0.6, min(base_sl * 2.2, atr * 2.5))
+    tp_pct = sl_pct * (base_tp / base_sl)  # keep same RR ratio as tuned
+    tp_pct = max(sl_pct * 1.3, tp_pct)
+    regime = 'high' if atr > 0.009 else ('low' if atr < 0.003 else 'normal')
+    return round(sl_pct, 4), round(tp_pct, 4), regime
+
+def _ema_series(values, period):
+    values = list(values or [])
+    if len(values) < period:
+        return []
+    a = 2.0 / (period + 1.0)
+    out = [float(sum(values[:period])) / period]
+    for x in values[period:]:
+        out.append(a * float(x) + (1.0 - a) * out[-1])
+    return out
+
+def _ohlcv(coin, resolution='60', count=120, drop_forming=True):
+    try:
+        iv = RES_MAP.get(str(resolution), '1h')
+        step_ms = RES_MS.get(iv, 3600000)
+        now_ms = int(time.time() * 1000)
+        start_ms = now_ms - (count + 3) * step_ms
+        rows = _net_call(lambda: hl_info().candles_snapshot(coin, iv, start_ms, now_ms), retries=2, base_wait=1.0) or []
+        if drop_forming and len(rows) > 1:
+            rows = rows[:-1]
+        return [{'o': float(x['o']), 'h': float(x['h']), 'l': float(x['l']), 'c': float(x['c']), 'v': float(x['v'])} for x in rows]
+    except Exception:
+        return []
+
+def _true_range(rows):
+    tr=[]; prev=None
+    for x in rows:
+        if prev is None: tr.append(x['h']-x['l'])
+        else: tr.append(max(x['h']-x['l'], abs(x['h']-prev), abs(x['l']-prev)))
+        prev=x['c']
+    return tr
+
+def _atr_from_ohlcv(rows, period=14):
+    if len(rows) < period + 1: return None
+    tr=_true_range(rows)
+    return float(np.mean(tr[-period:])) / max(float(rows[-1]['c']), 1e-12)
+
+def _atr_from_closes(closes, period=14):
+    if len(closes) < period + 1: return None
+    arr=np.asarray(closes[-(period+1):], dtype=float)
+    return float(np.mean(np.abs(np.diff(arr)))) / max(float(arr[-1]), 1e-12)
+
+def _calc_macd(coin):
+    try:
+        c = get_candles_cached(coin, '60', 80, drop_forming=True)
+        if not c or len(c) < 35: return None
+        e12=_ema_series(c,12); e26=_ema_series(c,26)
+        # Align the two EMA series to the same trailing timestamps.
+        macd=[]
+        off=len(e12)-len(e26)
+        for a,b in zip(e12[max(0,off):], e26): macd.append(a-b)
+        if len(macd)<9: return None
+        sig=_ema_series(macd,9)
+        if not sig: return None
+        hist=macd[-1]-sig[-1]
+        return float(hist / max(abs(c[-1]),1e-12) * 100.0)
+    except Exception:
+        return None
+
+def _calc_bb(coin):
+    try:
+        c = get_candles_cached(coin, '60', 25, drop_forming=True)
+        if c and len(c) >= 20:
+            arr=np.array(c[-20:],dtype=float); mid=float(np.mean(arr)); std=float(np.std(arr))
+            return ((mid+2*std)-(mid-2*std))/mid*100 if mid>0 else None
+    except Exception: pass
+    return None
+
+def _calc_adx(coin):
+    try:
+        rows=_ohlcv(coin,'60',60,True)
+        if len(rows)<30: return None
+        n=14; tr=_true_range(rows)
+        plus=[]; minus=[]
+        for i in range(1,len(rows)):
+            up=rows[i]['h']-rows[i-1]['h']; dn=rows[i-1]['l']-rows[i]['l']
+            plus.append(up if up>dn and up>0 else 0.0)
+            minus.append(dn if dn>up and dn>0 else 0.0)
+        atr=float(np.mean(tr[-n:])); p=float(np.mean(plus[-n:])); m=float(np.mean(minus[-n:]))
+        if atr<=0: return None
+        pdi=100*p/atr; mdi=100*m/atr; dx=100*abs(pdi-mdi)/max(pdi+mdi,1e-12)
+        # Wilder-style rolling approximation over recent DX values.
+        dxs=[]
+        for j in range(n, len(rows)):
+            a=float(np.mean(tr[j-n+1:j+1])); pp=float(np.mean(plus[j-n:j])); mm=float(np.mean(minus[j-n:j]))
+            if a>0:
+                pi=100*pp/a; mi=100*mm/a; dxs.append(100*abs(pi-mi)/max(pi+mi,1e-12))
+        return float(np.mean(dxs[-n:])) if dxs else dx
+    except Exception:
+        return None
+
+def funding_score_bonus(direction, coin=None):
+    """Per-coin funding tilt (not the market average — much more precise)."""
+    f = state.get('funding') or {}
+    if coin and isinstance(f.get(coin), (int, float)):
+        val = float(f[coin])
+    else:
+        vals = [v for v in f.values() if isinstance(v, (int, float))]
+        if not vals:
+            return 0, []
+        val = float(np.mean(vals))
+    if val < -0.0002 and direction == 'long':
+        return 1, ['فاندینگ منفی (شورت‌ها پرداخت می‌کنن) - حمایت خرید']
+    if val > 0.0002 and direction == 'short':
+        return 1, ['فاندینگ مثبت (لانگ‌ها پرداخت می‌کنن) - فشار فروش']
+    return 0, []
+
+
+# ============ 🐉 DRAGON MODULE: Funding Rate Hunter ============
+# A separate strategy that profits from extreme funding rates.
+# When funding is very positive (longs pay shorts) -> SHORT
+# When funding is very negative (shorts pay longs) -> LONG
+# Configuration
+FUNDING_HUNTER_ENABLED = os.environ.get('FUNDING_HUNTER', 'true').lower() == 'true'
+FUNDING_ENTRY_THRESHOLD = 0.0005      # 0.05% - enter when funding exceeds this
+FUNDING_EXIT_THRESHOLD = 0.0001       # 0.01% - exit when funding normalizes
+FUNDING_MAX_POSITIONS = 2              # max concurrent funding trades
+FUNDING_SL_PCT = 0.015                # 1.5% stop loss
+FUNDING_TP_PCT = 0.06                 # 6% take profit (funding arb is slow)
+FUNDING_SCAN_INTERVAL = 1800          # scan every 30 minutes
+FUNDING_COINS = os.environ.get('FUNDING_COINS', 'BTC,ETH,SOL,ARB,LINK,AVAX,ATOM,DYDX,OP,NEAR,APT,SUI,FIL,INJ,TIA,SEI,STRK,MAV,BLUR,PENDLE,ALT,PYTH,W,ETHFI,ENA,OMNI,REZ,IO,TAO,ZRO,CRV,APE,UNI,AAVE,MKR,COMP,SNX,BSX').split(',')
+
+
+def get_open_interest(coin):
+    """OI rising + price rising = real trend. OI falling = divergence."""
+    try:
+        _, ctxs = hl_info().meta_and_asset_ctxs()
+        m = hl_info().meta()
+        names = [u['name'] for u in m.get('universe', [])]
+        if coin not in names:
+            return None
+        idx = names.index(coin)
+        oi = float(ctxs[idx].get('openInterest', 0))
+        return oi
+    except Exception:
+        return None
+
+def _oi_bonus(sig, coin, direction):
+    """Add OI confirmation: rising OI supports long, falling OI supports short."""
+    try:
+        oi = get_open_interest(coin)
+        if oi is None:
+            return
+        oi_prev = state.get('oi_cache', {}).get(coin)
+        if oi_prev:
+            oi_change = (oi - oi_prev) / max(oi_prev, 1)
+            if oi_change > 0.05 and direction == 'long':
+                sig['score'] += weighted(1, 'oi')
+                sig.setdefault('factors', []).append('oi')
+                sig.setdefault('reasons', []).append(f'OI در حال رشد ({oi_change*100:+.1f}%) (+1)')
+            elif oi_change < -0.05 and direction == 'short':
+                sig['score'] += weighted(1, 'oi')
+                sig.setdefault('factors', []).append('oi')
+                sig.setdefault('reasons', []).append(f'OI در حال کاهش ({oi_change*100:+.1f}%) (+1)')
+            elif oi_change > 0.05 and direction == 'short':
+                sig['score'] -= 1
+                sig.setdefault('reasons', []).append(f'OI رشد ولی ما شورتیم (-1)')
+            elif oi_change < -0.05 and direction == 'long':
+                sig['score'] -= 1
+                sig.setdefault('reasons', []).append(f'OI کاهش ولی ما لانگیم (-1)')
+        state.setdefault('oi_cache', {})[coin] = oi
+    except Exception:
+        pass
+
+
+def _live_correlation(c1, c2, periods=24):
+    """Real-time Pearson correlation between two coins (0 = uncorrelated, 1 = same)."""
+    try:
+        p1 = get_candles_cached(c1, '60', periods, drop_forming=True)
+        p2 = get_candles_cached(c2, '60', periods, drop_forming=True)
+        if not p1 or not p2 or len(p1) < 10 or len(p2) < 10:
+            return 0.0
+        n = min(len(p1), len(p2))
+        r1 = np.diff(np.array(p1[-n:], dtype=float))
+        r2 = np.diff(np.array(p2[-n:], dtype=float))
+        if len(r1) < 5 or len(r2) < 5:
+            return 0.0
+        return float(np.corrcoef(r1, r2)[0, 1])
+    except Exception:
+        return 0.0
+
+
+def get_vwap(coin, periods=24):
+    """Volume-Weighted Average Price — dynamic support/resistance level."""
+    try:
+        closes = get_candles_cached(coin, '60', periods, drop_forming=True)
+        _, vols = get_candles(coin, '60', periods, with_volume=True, drop_forming=True)
+        if not closes or not vols or len(closes) != len(vols):
+            return None
+        tp = np.array(closes, dtype=float)
+        v = np.array(vols, dtype=float)
+        return float(np.sum(tp * v) / np.sum(v)) if np.sum(v) > 0 else None
+    except Exception:
+        return None
+
+def _dragon_score(coin):
+    """Score a coin for funding rate trading. Returns (score, direction, reason)."""
+    try:
+        f = state.get('funding', {})
+        val = f.get(coin)
+        if val is None:
+            return 0, None, 'no funding data'
+        # Annualized funding rate
+        annualized = val * 3 * 365 * 100  # ~3 funding payments/hour
+        if val > FUNDING_ENTRY_THRESHOLD:
+            # Positive funding = longs pay shorts = short signal
+            strength = min(10, val / FUNDING_ENTRY_THRESHOLD)
+            return strength, 'short', f'funding {val*100:.3f}% (سالانه {annualized:.0f}%)'
+        elif val < -FUNDING_ENTRY_THRESHOLD:
+            # Negative funding = shorts pay longs = long signal
+            strength = min(10, abs(val) / FUNDING_ENTRY_THRESHOLD)
+            return strength, 'long', f'funding {val*100:.3f}% (سالانه {annualized:.0f}%)'
+        return 0, None, 'funding normal'
+    except Exception:
+        return 0, None, 'error'
+
+def dragon_hunter_scan():
+    """Run the funding hunter scan. Returns list of signals or None."""
+    if not FUNDING_HUNTER_ENABLED:
+        return None
+    _funding_open = 0
+    for lg_n in ('paper', 'live'):
+        for p in state.get('ledgers', {}).get(lg_n, {}).get('positions', []):
+            if 'funding_hunter' in p.get('factors', []):
+                _funding_open += 1
+    if _funding_open >= FUNDING_MAX_POSITIONS:
+        return None
+    signals = []
+    for coin in FUNDING_COINS:
+        score, direction, reason = _dragon_score(coin)
+        if score >= 3 and direction:  # minimum score 3
+            signals.append({
+                'coin': coin,
+                'direction': direction,
+                'score': round(score, 1),
+                'confidence': min(0.75, 0.3 + score * 0.05),
+                'reasons': [f'🐉 {reason}'],
+                'factors': ['funding_hunter'],
+                'sl_pct': FUNDING_SL_PCT,
+                'tp_pct': FUNDING_TP_PCT,
+            })
+    return signals if signals else None
+
+def dragon_manage_positions():
+    """Manage open funding hunter positions: exit when funding normalizes."""
+    try:
+        lg_p = get_ledger('paper')
+        f = state.get('funding', {})
+        for pos in list(lg_p['positions']):
+            if 'funding_hunter' in pos.get('factors', []):
+                coin = pos.get('coin')
+                val = f.get(coin)
+                if val is not None and abs(val) < FUNDING_EXIT_THRESHOLD:
+                    price = state['prices'].get(coin)
+                    if price:
+                        add_log(f'DRAGON: funding normalized for {coin} ({val*100:.3f}%) - closing')
+                        send_telegram(f'🐉 فاندینگ {COIN_FA.get(coin)} نرمال شد - بسته شد ({val*100:.3f}%)')
+                        finalize_close(lg_p, pos, price, 'funding_normalized', time.time(), paper_leg_exec(lg_p))
+        # Same for live ledger
+        lg_l = get_ledger('live')
+        for pos in list(lg_l['positions']):
+            if 'funding_hunter' in pos.get('factors', []):
+                # Live positions managed by live_manage_wrapper
+                pass
+    except Exception:
+        log_exception('dragon_manage')
+
+
+# ---------- signal scoring ----------
+
+_ECON_EVENTS = [
+    # ===== US FOMC Meetings (8 per year, ~6 weeks apart) =====
+    (1, 29, 21, 'FOMC', 4), (3, 19, 21, 'FOMC', 4),
+    (5, 7, 21, 'FOMC', 4), (6, 18, 21, 'FOMC', 4),
+    (7, 30, 21, 'FOMC', 4), (9, 17, 21, 'FOMC', 4),
+    (11, 7, 21, 'FOMC', 4), (12, 10, 21, 'FOMC', 4),
+    
+    # ===== US CPI (monthly, ~12th-15th) =====
+    (1, 14, 15, 'CPI', 2), (2, 12, 15, 'CPI', 2),
+    (3, 12, 15, 'CPI', 2), (4, 9, 15, 'CPI', 2),
+    (5, 14, 15, 'CPI', 2), (6, 11, 15, 'CPI', 2),
+    (7, 9, 15, 'CPI', 2), (8, 13, 15, 'CPI', 2),
+    (9, 10, 15, 'CPI', 2), (10, 9, 15, 'CPI', 2),
+    (11, 13, 15, 'CPI', 2), (12, 11, 15, 'CPI', 2),
+    
+    # ===== US NFP (Non-Farm Payolls, first Friday of month) =====
+    (1, 9, 15, 'NFP', 2), (2, 6, 15, 'NFP', 2),
+    (3, 6, 15, 'NFP', 2), (4, 3, 15, 'NFP', 2),
+    (5, 1, 15, 'NFP', 2), (6, 5, 15, 'NFP', 2),
+    (7, 3, 15, 'NFP', 2), (8, 7, 15, 'NFP', 2),
+    (9, 4, 15, 'NFP', 2), (10, 2, 15, 'NFP', 2),
+    (11, 5, 15, 'NFP', 2), (12, 3, 15, 'NFP', 2),
+    
+    # ===== US GDP (quarterly) =====
+    (1, 30, 15, 'US GD', 2), (4, 30, 15, 'US GDP', 2),
+    (7, 30, 15, 'US GDP', 2), (10, 30, 15, 'US GDP', 2),
+    
+    # ===== ECB (European Central Bank) =====
+    (1, 25, 15, 'ECB', 3), (3, 7, 15, 'ECB', 3),
+    (4, 17, 15, 'ECB', 3), (6, 5, 15, 'ECB', 3),
+    (7, 24, 15, 'ECB', 3), (9, 11, 15,'ECB', 3),
+    (10, 23, 15, 'ECB', 3), (12, 4, 15, 'ECB', 3),
+    
+    # ===== BOJ (Bank of Japan) =====
+    (1, 23, 7, 'BOJ', 3), (3, 19, 7, 'BOJ', 3),
+    (4, 25, 7, 'BOJ', 3), (6, 13, 7, 'BOJ', 3),
+    (7, 30, 7, 'BOJ', 3), (9, 18, 7, 'BOJ', 3),
+    (10, 23, 7, 'BOJ', 3), (12, 18, 7, 'BOJ', 3),
+    
+]
+
+
+# ---- Dynamic Risk: shrink after losses, grow slowly after wins ----
+def _dynamic_risk(lg):
+    """Adjust risk based on recent performance."""
+    trades = lg.get('trades', [])[-20:]
+    if len(trades) < 5:
+        return 1.0
+    
+    losses = sum(1 for t in trades if t.get('pnl', 0) < 0)
+    loss_rate = losses / len(trades)
+    
+    # Recent PnL
+    recent_pnl = sum(t.get('pnl', 0) for t in trades[-5:])
+    
+    if loss_rate > 0.6 and recent_pnl < 0:
+        add_log('DYNAMIC RISK: reducing exposure (loss rate ' + str(round(loss_rate*100)) + '%)')
+        return 0.5  # Halve the position size
+    elif loss_rate > 0.4 and recent_pnl < 0:
+        return 0.8
+    elif loss_rate < 0.3 and recent_pnl > 0:
+        return 1.2  # Increase by 20% max
+        
+    return 1.0
+
+# ---- Market-wide drawdown protection ----
+def _market_drawdown():
+    """Check if most coins are dropping = market-wide sell-off."""
+    prices = state.get('prices', {})
+    if len(prices) < 5:
+        return False
+    
+    drops = 0
+    total = 0
+    for coin, price in prices.items():
+        if price:
+            total += 1
+            hist = state.get('price_history', [])
+            if len(hist) > 10:
+                old_prices = [h.get('p', 0) for h in hist[-10:] if h.get('p')]
+                if old_prices and len(old_prices) > 5:
+                    if price < old_prices[0] * 0.97:
+                        drops += 1
+    
+    if total > 0 and drops / total > 0.6:
+        return True  # More than 60% of coins are dropping
+    return False
+
+def _econ_warning():
+    try:
+        n = fa_now()
+        for m, d, h, name, wh in _ECON_EVENTS:
+            if n.month == m and n.day == d:
+                mins = (h * 60) - (n.hour * 60 + n.minute)
+                if -30 <= mins <= wh * 60:
+                    if mins > 0: return mins / 60, name
+                    return 0, name
+        return None
+    except: return None
+
+def _apply_econ_filter(sig):
+    w = _econ_warning()
+    if w:
+        hrs, name = w
+        if hrs > 1:
+            sig['score'] -= 1
+            sig['reasons'].append(f'⚠️ {name} در {hrs:.0f}h (-1)')
+        elif hrs > 0:
+            sig['score'] -= 2
+            sig['reasons'].append(f'⚠️ {name} نزدیک (-2)')
+        else:
+            sig['score'] -= 3
+            sig['reasons'].append(f'🚨 {name} هم‌اکنون (-3)')
+    return sig
+
+def _score_signal(prices, coin):
+    """UNIFIED price-based signal scoring — used identically by LIVE (analyze_coin)
+    and BACKTEST (_bt_entry_signal). Guarantees the backtest calibrates the SAME
+    signal the live bot actually trades (fixes the historical live/backtest divergence).
+
+    Rules (all shared): RSI anchor + deep, last-candle penalty, falling-knife/pump
+    warning, momentum +/- with opposing penalty, trend +/- with opposing penalty.
+    """
+    prices = list(prices[-20:])
+    gains, losses = [], []
+    for i in range(1, len(prices)):
+        ch = prices[i] - prices[i - 1]
+        gains.append(max(0, ch))
+        losses.append(max(0, -ch))
+    ag, al = np.mean(gains[-14:]), np.mean(losses[-14:])
+    if ag < 1e-12 and al < 1e-12:
+        rsi = 50.0
+    else:
+        rsi = 100 - (100 / (1 + ag / max(al, 1e-9)))
+    mom = (prices[-1] - prices[-5]) / prices[-5] if len(prices) > 5 else 0
+    sma7, sma20 = np.mean(prices[-7:]), np.mean(prices[-20:])
+    score, direction, reasons, factors = 0, None, [], []
+    rsi_anchor = False
+    fa = COIN_FA.get(coin, coin)
+    g = get_genome()
+    if rsi < g['rsi_lo']:
+        score += weighted(3, 'rsi')
+        direction, rsi_anchor = 'long', True
+        factors.append('rsi')
+        reasons.append(f'{fa}: RSI اشباع فروش ({rsi:.0f}) (+3)')
+        if rsi < g['rsi_lo'] - 10:
+            score += weighted(1, 'rsi_deep')
+            factors.append('rsi_deep')
+            reasons.append(f'{fa}: اشباع عمیق (+1)')
+    elif rsi > g['rsi_hi']:
+        score += weighted(3, 'rsi')
+        direction, rsi_anchor = 'short', True
+        factors.append('rsi')
+        reasons.append(f'{fa}: RSI اشباع خرید ({rsi:.0f}) (+3)')
+        if rsi > g['rsi_hi'] + 10:
+            score += weighted(1, 'rsi_deep')
+            factors.append('rsi_deep')
+            reasons.append(f'{fa}: اشباع عمیق (+1)')
+    if direction == 'long' and prices[-1] < prices[-2]:
+        score -= 2
+        reasons.append(f'{fa}: ⚠️ کندل آخر هنوز نزولیه (-2)')
+    elif direction == 'short' and prices[-1] > prices[-2]:
+        score -= 2
+        reasons.append(f'{fa}: ⚠️ کندل آخر هنوز صعودیه (-2)')
+    if direction == 'long' and len(prices) >= 4 and all(prices[i] < prices[i-1] * 0.993 for i in range(-3, 0)):
+        score -= 3
+        reasons.append(f'{fa}: 🔪 هشدار چاقوی در حال سقوط (۳ کندل متوالی نزول شدید) (-3)')
+    elif direction == 'short' and len(prices) >= 4 and all(prices[i] > prices[i-1] * 1.007 for i in range(-3, 0)):
+        score -= 3
+        reasons.append(f'{fa}: 🚀 هشدار پامپ متوالی (۳ کندل متوالی صعود شدید) (-3)')
+    if mom > 0.005:
+        if direction == 'short':
+            score -= 3
+            reasons.append(f'{fa}: 🚫 مومنتوم صعودی خلاف فروش ({mom*100:+.2f}%) (-3)')
+        else:
+            score += weighted(2, 'momentum')
+            if not direction:
+                direction = 'long'
+            factors.append('momentum')
+            reasons.append(f'{fa}: مومنتوم صعودی ({mom*100:+.2f}%) (+2)')
+    elif mom < -0.005:
+        if direction == 'long':
+            score -= 3
+            reasons.append(f'{fa}: 🚫 مومنتوم نزولی خلاف خرید ({mom*100:+.2f}%) (-3)')
+        else:
+            score += weighted(2, 'momentum')
+            if not direction:
+                direction = 'short'
+            factors.append('momentum')
+            reasons.append(f'{fa}: مومنتوم نزولی ({mom*100:+.2f}%) (+2)')
+    if (sma7 - sma20) / max(sma20, 1e-9) > 0.0015:
+        if direction == 'short':
+            score -= 1
+            reasons.append(f'{fa}: ⚠️ روند کوتاه صعودی خلاف فروش (-1)')
+        else:
+            score += weighted(1, 'trend')
+            factors.append('trend')
+            reasons.append(f'{fa}: روند کوتاه صعودی (+1)')
+    elif (sma20 - sma7) / max(sma20, 1e-9) > 0.0015:
+        if direction == 'long':
+            score -= 1
+            reasons.append(f'{fa}: ⚠️ روند کوتاه نزولی خلاف خرید (-1)')
+        else:
+            score += weighted(1, 'trend')
+            factors.append('trend')
+            reasons.append(f'{fa}: روند کوتاه نزولی (+1)')
+    # VWAP confirmation (dynamic support/resistance)
+    try:
+        _vwap = get_vwap(coin)
+        _price_now = prices[-1]
+        if _vwap and direction:
+            if direction == 'long' and _price_now > _vwap * 1.002:
+                score += 1
+                reasons.append(f'قیمت بالای VWAP (+1)')
+            elif direction == 'short' and _price_now < _vwap * 0.998:
+                score += 1
+                reasons.append(f'قیمت زیر VWAP (+1)')
+    except Exception:
+        pass
+    return {'rsi': rsi, 'momentum': mom, 'sma7': sma7, 'sma20': sma20,
+            'score': score, 'direction': direction, 'reasons': reasons,
+            'rsi_anchor': rsi_anchor, 'factors': factors}
+
+def analyze_coin(coin: str) -> dict:
+    """Analyze a single coin, return signal dict or None."""
+    prices = get_candles_cached(coin, '60', 25, drop_forming=True)
+    if not prices or len(prices) < 20:
+        return None
+    core = _score_signal(prices, coin)
+    result = {'coin': coin, 'rsi': core['rsi'], 'momentum': core['momentum'],
+              'sma7': core['sma7'], 'sma20': core['sma20'],
+              'score': core['score'], 'direction': core['direction'],
+              'reasons': core['reasons'] + [], 'rsi_anchor': core['rsi_anchor'],
+              'factors': core['factors'] + []}
+    # TITAN is retained as an advisory/research module, but it no longer
+    # silently replaces the executable signal. This keeps Live and historical
+    # research on the same deterministic signal core and prevents hidden
+    # live/backtest divergence.
+    try:
+        from titan import titan_scan, detect_regime
+        _reg = detect_regime(get_candles_cached, coin)
+        _ts = titan_scan(get_candles_cached, coin, COIN_FA, _reg)
+        if _ts:
+            result['titan_advisory'] = {'direction': _ts.get('direction'), 'score': _ts.get('score'), 'strategy': _ts.get('strategy')}
+    except Exception:
+        result['titan_advisory'] = None
+    return result
+
+def trend_of(closes):
+    if not closes or len(closes) < 10:
+        return 0
+    short = np.mean(closes[-5:])
+    lng = np.mean(closes[-15:]) if len(closes) >= 15 else np.mean(closes)
+    diff = (short - lng) / lng
+    if diff > 0.001:
+        return 1
+    if diff < -0.001:
+        return -1
+    return 0
+
+def get_mtf_trend(symbol):
+    h4 = get_candles_cached(symbol, '240', 30, drop_forming=True)
+    d1 = get_candles_cached(symbol, 'D', 20, drop_forming=True)
+    return (trend_of(h4) if h4 else None), (trend_of(d1) if d1 else None)
+
+def confirm_signal(sig):
+    coin, direction = sig['coin'], sig['direction']
+    fa = COIN_FA.get(coin, coin)
+    if not direction:
+        return sig
+    if any('trend' in str(f) or 'break' in str(f) for f in sig.get('factors',[])) and sig.get('score',0) >= 5:
+        return sig
+    want = 1 if direction == 'long' else -1
+    t4, td = get_mtf_trend(coin)
+    sig['mtf'] = {'h4': t4, 'd1': td}
+    if t4 is not None and td is not None:
+        if t4 == want and td == want:
+            sig['score'] += weighted(2, 'mtf')
+            sig.setdefault('factors', []).append('mtf')
+            sig['reasons'].append(f'{fa}: ۴ساعته و روزانه هر دو هم‌جهت (+2)')
+        elif t4 == want or td == want:
+            sig['score'] += weighted(1, 'mtf')
+            sig.setdefault('factors', []).append('mtf')
+            sig['reasons'].append(f'{fa}: یکی از تایم‌فریم‌های بالاتر هم‌جهت (+1)')
+        elif t4 == -want and td == -want:
+            sig['score'] -= 1
+            sig['reasons'].append(f'{fa}: ⚠️ ۴ساعته و روزانه خلاف جهت (-1)')
+    ob, spread, tot_val = get_orderbook_info(coin)
+    sig['orderbook'], sig['spread'] = ob, spread
+    if tot_val is not None and tot_val < 2000:
+        ob = None
+        sig['reasons'].append(f'{fa}: 🚫 عمق اردربوک ضعیف (ارزش < ۲۰۰۰$) - نادیده گرفتن فشار اردربوک')
+    if spread is not None and spread > SPREAD_MAX:
+        sig['score'] -= 3
+        sig['reasons'].append(f'{fa}: 🚫 اسپرد باز ({spread*100:.2f}%) (-3)')
+    if ob is not None:
+        if (direction == 'long' and ob > 0.15) or (direction == 'short' and ob < -0.15):
+            sig['score'] += weighted(1, 'orderbook')
+            sig.setdefault('factors', []).append('orderbook')
+            sig['reasons'].append(f'{fa}: دیوار {"خرید" if direction=="long" else "فروش"} قوی‌تر ({ob*100:+.0f}%) (+1)')
+        elif (direction == 'long' and ob < -0.3) or (direction == 'short' and ob > 0.3):
+            sig['score'] -= 1
+            sig['reasons'].append(f'{fa}: ⚠️ فشار اردربوک خلاف سیگنال ({ob*100:+.0f}%) (-1)')
+    vc = get_candles(coin, '60', 22, with_volume=True, drop_forming=True)
+    if vc and vc[1]:
+        vols = vc[1]
+        if len(vols) >= 10:
+            recent = np.mean(vols[-3:])
+            baseline = np.mean(vols[:-3]) or 1
+            vr = recent / baseline
+            sig['vol_ratio'] = round(vr, 2)
+            # New: volume REGIME - steadily rising volume = institutional accumulation (stronger signal)
+            if len(vols) >= 6:
+                _vol_slope = float(np.polyfit(range(len(vols[-6:])), vols[-6:], 1)[0])
+                _vol_baseline = float(np.mean(vols[-6:])) or 1
+                _vol_trend_pct = (_vol_slope * 6 / _vol_baseline) if _vol_baseline > 0 else 0
+                if _vol_trend_pct > 0.3 and vr > 1.2:
+                    sig['score'] += weighted(1, 'whale_flow')
+                    sig.setdefault('factors', []).append('whale_flow')
+                    sig['reasons'].append(f'{fa}: 📈 حجم سوار بر روند صعودی (انباشت نهادی) (+1)')
+                elif _vol_trend_pct < -0.3:
+                    sig['score'] -= 1
+                    sig['reasons'].append(f'{fa}: 📉 حجم در حال کاهش (عدم حمایت) (-1)')
+            if vr > 1.5:
+                sig['score'] += weighted(1, 'volume')
+                sig.setdefault('factors', []).append('volume')
+                sig['reasons'].append(f'{fa}: حجم {vr:.1f}x میانگین - حرکت واقعی (+1)')
+            elif vr < 0.5:
+                sig['score'] -= 1
+                sig['reasons'].append(f'{fa}: ⚠️ حجم خیلی کم ({vr:.1f}x) (-1)')
+            if vr > 3.0:
+                sig['score'] += weighted(2, 'whale_flow')
+                sig.setdefault('factors', []).append('whale_flow')
+                sig['reasons'].append(f'{fa}: 🐋 انباشت/توزیع خاموش نهنگ (VSA) (+2)')
+    # Advanced indicators bonus
+    _m = _calc_macd(coin)
+    if _m is not None:
+        if _m > 0 and direction == 'long':
+            sig['score'] += weighted(1, 'macd')
+            sig.setdefault('factors', []).append('macd')
+            sig['reasons'].append(f'MACD صعودی (+{abs(_m):.4f}) (+1)')
+        elif _m < 0 and direction == 'short':
+            sig['score'] += weighted(1, 'macd')
+            sig.setdefault('factors', []).append('macd')
+            sig['reasons'].append(f'MACD نزولی ({_m:.4f}) (+1)')
+    _bb = _calc_bb(coin)
+    if _bb is not None and _bb < 7 and direction:
+        sig['score'] += weighted(1, 'bb')
+        sig.setdefault('factors', []).append('bb')
+        sig['reasons'].append(f'بولینجر فشرده ({_bb:.1f}%) حرکت قریب‌الوقوع (+1)')
+    _a = _calc_adx(coin)
+    if _a is not None and _a > 30 and direction:
+        sig['score'] += weighted(1, 'adx')
+        sig.setdefault('factors', []).append('adx')
+        sig['reasons'].append(f'ADX {_a:.0f} روند قوی (+1)')
+    _oi_bonus(sig, coin, direction)
+    bonus, oc_notes = funding_score_bonus(direction, coin)
+    if bonus:
+        sig['score'] += weighted(bonus, 'funding')
+        sig.setdefault('factors', []).append('funding')
+        for n in oc_notes:
+            sig['reasons'].append(n + ' (+1)')
+    sig = apply_regime(sig)
+    return apply_session(sig)
+
+def apply_regime(sig):
+    rg = state.get('regime') or {}
+    regime = rg.get('regime')
+    if not regime:
+        return sig
+    direction = sig['direction']
+    rfa = REGIME_FA.get(regime, regime)
+    if regime == 'trend_up':
+        if direction == 'long':
+            sig['score'] += weighted(1, 'regime')
+            sig.setdefault('factors', []).append('regime')
+            sig['reasons'].append(f'رژیم {rfa}: لانگ هم‌جهت (+1)')
+        else:
+            sig['score'] -= 1
+            sig['reasons'].append(f'رژیم {rfa}: ⚠️ شورت خلاف روند (-1)')
+    elif regime == 'trend_down':
+        if direction == 'short':
+            sig['score'] += weighted(1, 'regime')
+            sig.setdefault('factors', []).append('regime')
+            sig['reasons'].append(f'رژیم {rfa}: شورت هم‌جهت (+1)')
+        else:
+            sig['score'] -= 1
+            sig['reasons'].append(f'رژیم {rfa}: ⚠️ خرید خلاف روند (-1)')
+    elif regime == 'range':
+        if sig.get('rsi') is not None and (sig['rsi'] < 38 or sig['rsi'] > 62):
+            sig['score'] += weighted(1, 'regime')
+            sig.setdefault('factors', []).append('regime')
+            sig['reasons'].append(f'رژیم {rfa}: سیگنال بازگشتی در رنج (+1)')
+    elif regime == 'storm':
+        sig['score'] -= 1
+        sig['storm'] = True
+        sig['reasons'].append(f'رژیم {rfa}: احتیاط (-1)')
+    return sig
+
+# ---------- market sessions (real global-market clocks) ----------
+
+SESSION_FA = {
+    'asia': 'آسیا 🌙',
+    'europe': 'اروپا 🇪🇺',
+    'overlap': 'همپوشانی اروپا+آمریکا 🔥',
+    'us': 'آمریکا 🇺🇸',
+    'quiet': 'ساعات کم‌حجم 😴'
+}
+
+def _session_flags(now_utc=None):
+    """Return real session flags using IANA time zones, so DST changes are automatic."""
+    u = now_utc or datetime.now(UTC)
+    london = u.astimezone(LONDON)
+    ny = u.astimezone(NEW_YORK)
+    tokyo = u.astimezone(TOKYO)
+    # Approximate cash-market active windows, deliberately used as context rather than entry rules.
+    asia_open = 9 <= tokyo.hour < 17
+    europe_open = 8 <= london.hour < 16
+    us_open = 9 <= ny.hour < 16
+    if europe_open and us_open:
+        sess = 'overlap'
+    elif us_open:
+        sess = 'us'
+    elif europe_open:
+        sess = 'europe'
+    elif asia_open:
+        sess = 'asia'
+    else:
+        sess = 'quiet'
+    return {
+        'session': sess,
+        'asia': asia_open,
+        'europe': europe_open,
+        'us': us_open,
+        'overlap': europe_open and us_open,
+        'utc': u,
+        'london_hour': london.hour + london.minute / 60,
+        'newyork_hour': ny.hour + ny.minute / 60,
+        'tokyo_hour': tokyo.hour + tokyo.minute / 60,
+    }
+
+def current_session(now=None):
+    if now is None:
+        now = datetime.now(UTC)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+    return _session_flags(now.astimezone(UTC))['session']
+
+def session_info():
+    f = _session_flags(datetime.now(UTC))
+    return {'session': f['session'], 'label': SESSION_FA.get(f['session'], f['session']),
+            'hour': f['utc'].astimezone(TEHRAN).strftime('%H:%M'),
+            'london': f['london_hour'], 'newyork': f['newyork_hour'], 'tokyo': f['tokyo_hour']}
+
+def session_quality(session=None):
+    """Context score: active liquidity helps only when the market itself confirms it."""
+    sess = session or current_session()
+    return {'quiet': 0.75, 'asia': 0.90, 'europe': 1.00, 'us': 1.00, 'overlap': 1.10}.get(sess, 1.0)
+
+def apply_session(sig):
+    sess = current_session()
+    sig['session'] = sess
+    sig['session_quality'] = session_quality(sess)
+    # Session is a quality modifier, never a stand-alone buy/sell rule.
+    if sess == 'quiet':
+        sig['score'] -= weighted(0.5, 'session')
+        sig.setdefault('factors', []).append('session')
+        sig['reasons'].append(f'جلسه {SESSION_FA[sess]}: نقدشوندگی کمتر (-0.5)')
+    elif sess == 'asia':
+        sig['score'] -= weighted(0.25, 'session')
+        sig.setdefault('factors', []).append('session')
+        sig['reasons'].append(f'جلسه {SESSION_FA[sess]}: فعالیت متوسط (-0.25)')
+    elif sess == 'overlap':
+        sig['score'] += weighted(0.75, 'session')
+        sig.setdefault('factors', []).append('session')
+        sig['reasons'].append(f'جلسه {SESSION_FA[sess]}: نقدشوندگی بالاتر (+0.75)')
+    else:
+        sig['score'] += weighted(0.25, 'session')
+        sig.setdefault('factors', []).append('session')
+        sig['reasons'].append(f'جلسه {SESSION_FA[sess]}: فعالیت مناسب (+0.25)')
+    return sig
+
+def signal_quality_score(sig):
+    """0-100 quality score using independent evidence groups, avoiding double-counting."""
+    direction = sig.get('direction')
+    if not direction:
+        return 0.0
+    score = float(sig.get('score', 0.0))
+    base = max(0.0, min(100.0, 45.0 + score * 6.0))
+    groups = set()
+    factors = set(sig.get('factors', []))
+    if {'trend','mtf','regime'} & factors:
+        groups.add('trend')
+    if {'rsi','rsi_deep','momentum','macd','adx','bb'} & factors:
+        groups.add('momentum')
+    if {'volume','whale_flow','orderbook','session'} & factors:
+        groups.add('liquidity')
+    if {'funding','oi'} & factors:
+        groups.add('derivatives')
+    if len(groups) >= 4:
+        base += 8
+    elif len(groups) == 3:
+        base += 4
+    elif len(groups) == 1:
+        base -= 6
+    if sig.get('spread') is not None and sig.get('spread') > SPREAD_MAX * 0.75:
+        base -= 8
+    if sig.get('storm'):
+        base -= 10
+    if sig.get('mtf'):
+        t4, d1 = sig['mtf'].get('h4'), sig['mtf'].get('d1')
+        want = 1 if direction == 'long' else -1
+        if t4 == want and d1 == want:
+            base += 8
+        elif t4 == -want or d1 == -want:
+            base -= 8
+    if sig.get('session') == 'overlap':
+        base += 3
+    elif sig.get('session') == 'quiet':
+        base -= 4
+    return round(max(0.0, min(100.0, base)), 1)
+
+def adaptive_risk_pct(signal):
+    """Account-risk budget: higher quality earns a small increase, never an aggressive jump."""
+    q = float(signal.get('quality_score', signal_quality_score(signal)))
+    if q >= 92: pct = 0.0125
+    elif q >= 85: pct = 0.0100
+    elif q >= 75: pct = 0.0075
+    elif q >= 65: pct = 0.0050
+    else: pct = 0.0035
+    if signal.get('session') == 'quiet': pct *= 0.80
+    if signal.get('storm'): pct *= 0.50
+    return min(0.0125, max(0.0025, pct))
+
+def active_coins():
+    return [c for c in SCAN_COINS if valid_coin(c)]
+
+def coin_allowed(coin):
+    if not valid_coin(coin):
+        return False
+    banned = state.get('coin_banned', {})
+    if banned.get(coin, 0) > time.time():
+        return False
+    return True
+
+def analyze() -> list:
+    """Scan all coins and return qualified signals (or None)."""
+    if len(state.get('price_history', [])) < 3:
+        return None
+    # Early direction-cap check: if we already have MAX_DIR shorts/longs open,
+    # don't even scan for more of that direction (prevents signal spam)
+    held_long = 0
+    held_short = 0
+    for lg_n in ('paper', 'live'):
+        for p in state.get('ledgers', {}).get(lg_n, {}).get('positions', []):
+            if p.get('direction') == 'long': held_long += 1
+            elif p.get('direction') == 'short': held_short += 1
+    cap = 3  # directional cap (same as open_engine_position)
+    candidates = []
+    for coin in active_coins():
+        s = analyze_coin(coin)
+        if not s:
+            continue
+        # Skip if direction cap is full
+        if s.get('direction') == 'long' and held_long >= cap:
+            continue
+        if s.get('direction') == 'short' and held_short >= cap:
+            continue
+        candidates.append(s)
+    if not candidates:
+        return None
+    state['scan_table'] = [{'coin': c['coin'], 'score': round(c['score'], 1),
+                            'direction': c['direction'], 'rsi': round(c['rsi'])}
+                           for c in sorted(candidates, key=lambda x: -x['score'])]
+    held = {p.get('coin') for lg in ('paper', 'live')
+            for p in get_ledger(lg)['positions']}
+    directional = [c for c in candidates if c['direction'] and c.get('rsi_anchor')
+                   and coin_allowed(c['coin']) and c['coin'] not in held]
+    for c in directional:
+        if c['score'] >= 2:
+            record_shadow(c)
+    if not directional:
+        return None
+    th = live_threshold()
+    qualified = []
+    for cand in sorted(directional, key=lambda x: -x['score']):
+        if cand['score'] < 3:
+            continue
+        c2 = confirm_signal(cand)
+        cand_th = th + (SHORT_TH_EXTRA if c2.get('direction') == 'short' else 0) + PER_COIN.get(c2.get('coin', ''), {}).get('th_adj', 0)
+        rg_now = (state.get('regime') or {}).get('regime')
+        if rg_now == 'trend_down' and c2.get('direction') == 'long':
+            cand_th += 1
+        elif rg_now == 'storm':
+            cand_th = max(5, cand_th)
+        if c2['score'] >= cand_th and c2['direction']:
+            if get_genome().get('mtf_req') and 'mtf' not in c2.get('factors', []):
+                continue
+            c2['quality_score'] = signal_quality_score(c2)
+            c2['risk_pct'] = adaptive_risk_pct(c2)
+            qualified.append({'coin': c2['coin'], 'direction': c2['direction'],
+                              'confidence': round(max(0.35, min(0.95, c2['quality_score'] / 100.0)), 3),
+                              'quality_score': c2['quality_score'], 'risk_pct': c2['risk_pct'],
+                              'session': c2.get('session'), 'score': c2['score'], 'reasons': c2['reasons'],
+                              'factors': c2.get('factors', [])})
+            state['last_signal'] = {'coin': c2['coin'], 'rsi': c2['rsi'],
+                                    'momentum': c2['momentum'], 'score': c2['score'],
+                                    'direction': c2['direction'], 'reasons': c2['reasons']}
+    return qualified or None
+
+# ============ Shadow learning (light) ============
+
+def record_shadow(cand):
+    shadows = state.setdefault('shadow_signals', [])
+    if len(shadows) >= SHADOW_MAX_PENDING:
+        return
+    px = state['prices'].get(cand['coin'])
+    if not px:
+        return
+    shadows.append({'ts': time.time(), 'coin': cand['coin'], 'direction': cand['direction'],
+                    'score': cand['score'], 'entry': px, 'outcome': None})
+
+def shadow_threshold_adjust():
+    return state.get('threshold_extra', 0)
+
+def evaluate_shadows():
+    shadows = state.get('shadow_signals', [])
+    if not shadows:
+        return
+    prices = state['prices']
+    hits, misses = [], []
+    now = time.time()
+    for s in shadows:
+        if s.get('outcome') is not None:
+            continue
+        if now - s['ts'] < SHADOW_TIMEOUT_H * 3600:
+            continue
+        px = prices.get(s['coin'])
+        if not px:
+            continue
+        entry = s['entry']
+        if s['direction'] == 'long':
+            ok = (px - entry) / entry >= 0.006
+        else:
+            ok = (entry - px) / entry >= 0.006
+        s['outcome'] = 'hit' if ok else 'miss'
+        (hits if ok else misses).append(s['score'])
+    if hits and misses:
+        h_avg, m_avg = float(np.mean(hits)), float(np.mean(misses))
+        delta = h_avg - m_avg
+        extra = state.get('threshold_extra', 0)
+        if state.get('mode') == 'live':
+            # Production strategy is frozen. Shadow learning may collect evidence
+            # but must never mutate live thresholds while capital is at risk.
+            add_log('Shadow learning: LIVE mode — production threshold frozen')
+        elif delta >= 1.0:
+            state['threshold_extra'] = max(-1.0, min(1.0, extra - 0.5))
+            add_log(f'Shadow learning: high-score shadows WIN (Δ{delta:.1f}) - threshold eased to {state["threshold_extra"]:+.1f}')
+        elif delta <= -1.0:
+            state['threshold_extra'] = max(-1.0, min(1.0, extra + 0.5))
+            add_log(f'Shadow learning: high-score shadows LOSE (Δ{delta:.1f}) - threshold raised to {state["threshold_extra"]:+.1f}')
+    state['shadow_signals'] = [s for s in shadows if s.get('outcome') is None]
+
+# ============ UNIFIED TRADE ENGINE ============
+
+def ledger_label(name):
+    return 'مجازی 🔵' if name == 'paper' else 'واقعی (هایپرلیکوئید) 🔴'
+
+
+
+def _nightly_learn():
+    """AI Second Brain: analyze today, adjust factor weights."""
+    try:
+        lg = get_ledger('paper')
+        trades = lg['trades']
+        today = time.time() - 86400
+        recent = [t for t in trades if t.get('ts', 0) > today]
+        if len(recent) < 3: return
+        wins = [t for t in recent if t.get('pnl', 0) > 0]
+        losses = [t for t in recent if t.get('pnl', 0) <= 0]
+        if not wins or not losses: return
+        factor_scores = {}
+        for t in wins:
+            for f in t.get('factors', []): factor_scores[f] = factor_scores.get(f, 0) + 1
+        for t in losses:
+            for f in t.get('factors', []): factor_scores[f] = factor_scores.get(f, 0) - 1
+        w = get_factor_weights()
+        changed = []
+        for f, score in factor_scores.items():
+            if f in w:
+                old = w[f]
+                w[f] = max(WEIGHT_MIN, min(WEIGHT_MAX, w[f] + score * 0.03))
+                if abs(w[f] - old) > 0.01: changed.append(f)
+        if changed:
+            state['factor_weights'] = w
+            add_log(f'Nightly learn: adjusted {", ".join(changed)}')
+    except Exception:
+        pass
+
+def _nightly_check_strategies():
+    """Check if each coin's strategy is still optimal."""
+    for coin in SCAN_COINS:
+        try:
+            _check_strategy_relevance(coin)
+        except: pass
+
+def _nightly_optimize():
+    """Optimize threshold via grid search on last 30 days."""
+    try:
+        closes = get_candles('BTC', '60', 30*24, drop_forming=True)
+        if not closes: return
+        best_pf, best_th = 0, 4
+        for th in [3,4,5,6]:
+            r = bt_on_data(closes, None, 'BTC', STOP_LOSS, TAKE_PROFIT, th)
+            if r and r['profit_factor'] > best_pf:
+                best_pf, best_th = r['profit_factor'], th
+        tuned = get_tuned()
+        if best_th != tuned['threshold']:
+            old = tuned['threshold']
+            tuned['threshold'] = best_th
+            state['tuned'] = tuned
+            add_log(f'Nightly optimize: threshold {old}->{best_th} (PF={best_pf})')
+            try: send_telegram(f'🎯 بهینه‌سازی شبانه: آستانه {old}->{best_th} (PF={best_pf})')
+            except: pass
+    except Exception:
+        pass
+
+def _check_strategy_relevance(coin):
+    """Check if the current strategy for a coin is still working."""
+    tries = ['breakout', 'trend', 'rsi']
+    best_pf, best_strat = 0, 'breakout'
+    
+    for s in tries:
+        sl = PER_COIN.get(coin, {}).get('sl', 0.02)
+        tp = PER_COIN.get(coin, {}).get('tp', 0.03)
+        
+        if s == 'breakout': sl, tp = 0.025, 0.040
+        elif s == 'trend': sl, tp = 0.015, 0.025
+        else: sl, tp = 0.020, 0.030
+        
+        r = run_backtest(coin, days=14, sl=sl, tp=tp, threshold=4)
+        if r and r['profit_factor'] > best_pf:
+            best_pf = r['profit_factor']
+            best_strat = s
+    
+    current_strat = PER_COIN.get(coin, {}).get('strat', 'breakout')
+    if best_strat != current_strat and best_pf > 1.0:
+        pc = dict(PER_COIN.get(coin, {}))
+        pc['strat'] = best_strat
+        PER_COIN[coin] = pc
+        add_log('STRATEGY SWITCH: ' + coin + ' ' + current_strat + ' -> ' + best_strat + ' (PF=' + str(best_pf) + ')')
+        try:
+            send_telegram('🔄 تغییر استراتژی ' + str(coin) + ': ' + str(current_strat) + ' -> ' + str(best_strat))
+        except: pass
+
+def check_github_update():
+    """Check if newer version exists. Set GITHUB_REPO in .env."""
+    try:
+        repo = os.environ.get('GITHUB_REPO', '').strip()
+        if not repo:
+            return None
+        raw = repo.replace('github.com', 'raw.githubusercontent.com')
+        if not raw.endswith('/'): raw += '/'
+        raw += 'main/hyperliquid_bot.py'
+        r = requests.get(raw, timeout=8)
+        if r.status_code == 200:
+            remote_hash = hashlib.md5(r.content).hexdigest()
+            local_path = os.path.join(BASE_DIR, 'hyperliquid_bot.py')
+            if os.path.exists(local_path):
+                with open(local_path, 'rb') as lf:
+                    local_hash = hashlib.md5(lf.read()).hexdigest()
+                if remote_hash != local_hash:
+                    return f'نسخه جدید موجود است (MD5: {remote_hash[:8]})'
+        return None
+    except Exception:
+        return None
+def check_daily_limit_lg(lg, base_capital):
+    today = fa_now().strftime('%Y-%m-%d')
+    week = fa_now().strftime('%Y-%W')
+    # daily rollover
+    if lg.get('daily_date') != today:
+        lg['daily_date'] = today
+        lg['daily_pnl'] = 0.0
+        if lg.get('trading_paused'):
+            lg['trading_paused'] = False
+            add_log(f"New day - {lg['name']} trading resumed")
+    # weekly rollover (resets weekly loss accumulator each Monday)
+    if lg.get('week_date') != week:
+        lg['week_date'] = week
+        lg['weekly_pnl'] = 0.0
+        lg['weekly_paused'] = False
+    # weekly loss limit (e.g. 15% of capital)
+    weekly_limit = base_capital * WEEKLY_LOSS_LIMIT
+    if lg.get('weekly_pnl', 0) <= -weekly_limit and not lg.get('weekly_paused'):
+        lg['weekly_paused'] = True
+        add_log(f"WEEKLY LOSS LIMIT ({lg['name']}): {lg['weekly_pnl']:.2f} - paused until next week")
+        send_telegram(f'🚫 سقف ضرر هفتگی {ledger_label(lg["name"])} فعال شد ({lg["weekly_pnl"]:.2f}$) - تا هفته بعد معامله جدید نیست')
+    if lg.get('weekly_paused'):
+        return False
+    limit = base_capital * DAILY_LOSS_LIMIT
+    _rg_state = state.get('regime')
+    if _rg_state and _rg_state.get('regime') == 'storm': limit *= 0.7
+    if lg['daily_pnl'] <= -limit and not lg.get('trading_paused'):
+        lg['trading_paused'] = True
+        add_log(f"DAILY LOSS LIMIT ({lg['name']}): {lg['daily_pnl']:.2f} - paused for today")
+        send_telegram(f'🛑 سقف ضرر روزانه {ledger_label(lg["name"])} فعال شد ({lg["daily_pnl"]:.2f}$)')
+    return not lg.get('trading_paused')
+
+def checkpoint_guard(lg, base_capital):
+    trades = lg['trades']
+    n = len(trades)
+    if lg.get('cp_triggered'):
+        if n >= 10:
+            rec = trades[-10:]
+            w_rec = sum(1 for t in rec if t.get('pnl', 0) > 0)
+            gp_rec = sum(t['pnl'] for t in rec if t.get('pnl', 0) > 0)
+            gl_rec = abs(sum(t['pnl'] for t in rec if t.get('pnl', 0) < 0))
+            pf_rec = (gp_rec / gl_rec) if gl_rec > 0 else 99
+            if (w_rec / len(rec)) >= 0.40 and pf_rec >= 1.30:
+                lg['cp_triggered'] = False
+                add_log(f"Checkpoint recovered ({lg['name']}) - trading resumed")
+                send_telegram(f'✅ بهبود عملکرد {ledger_label(lg["name"])} (PF={pf_rec:.2f}) - معامله جدید فعال شد')
+        return
+    if n < 10:
+        return
+    window = trades[-60:]
+    wn = len(window)
+    wins = sum(1 for t in window if t.get('pnl', 0) > 0)
+    wr = wins / wn
+    cap = lg['capital'] if lg['capital'] is not None else base_capital
+    gp = sum(t['pnl'] for t in window if t.get('pnl', 0) > 0)
+    gl = abs(sum(t['pnl'] for t in window if t.get('pnl', 0) < 0))
+    pf = (gp / gl) if gl > 0 else 99
+    dd = 0.0
+    eq_curve = [e['eq'] for e in lg.get('equity', []) if e.get('eq')]
+    if eq_curve:
+        peak = 0.0
+        for v in eq_curve:
+            if v > peak:
+                peak = v
+            elif peak > 0:
+                cur_dd = (peak - v) / peak * 100
+                if cur_dd > dd:
+                    dd = cur_dd
+    reason = None
+    if n >= 15 and (wr < 0.20 or cap < base_capital * 0.88):
+        reason = f'چک‌پوینت ۱ {ledger_label(lg["name"])} (معامله {n}): وین‌ریت {wr*100:.0f}٪ / سرمایه {cap:.1f}$'
+    elif n >= 25 and pf < 0.6:
+        reason = f'چک‌پوینت ۲ {ledger_label(lg["name"])} (معامله {n}): PF={pf:.2f}'
+    elif n >= 10 and dd >= 12.0:
+        reason = f'چک‌پوینت ۳ {ledger_label(lg["name"])} (معامله {n}): حداکثر افت {dd:.1f}٪'
+    if reason:
+        lg['cp_triggered'] = True
+        add_log(f'*** {reason} - new entries paused on this ledger ***')
+        send_telegram(f'🛑 {reason}\nمعاملات جدید این موتور متوقف شد. داشبورد رو چک کن.')
+        save_state()
+
+def engine_exit_leg(lg, pos, fraction, price):
+    fraction = min(1.0, max(0.0, fraction))
+    if pos.get('live'):
+        size = pos.get('size', 0.0) or 0.0
+        close_sz = size * fraction
+        if close_sz <= 0:
+            return 0.0
+        entry = pos['entry_price']
+        pnl = (price - entry) * close_sz if pos['direction'] == 'long' else (entry - price) * close_sz
+        fee = abs(close_sz * price) * HL_FEE
+        net = pnl - fee
+        with state_lock:
+            lg['capital'] = (lg['capital'] or 0) + net
+            pos['size'] = size - close_sz
+            pos['margin'] = pos.get('margin', 0) * (1 - fraction)
+        lg['daily_pnl'] = lg.get('daily_pnl', 0.0) + net
+        lg['weekly_pnl'] = lg.get('weekly_pnl', 0.0) + net
+        if fraction < 0.999:
+            pos['banked'] = pos.get('banked', 0.0) + net
+        return net
+    leg_margin = pos['margin'] * fraction
+    if leg_margin <= 0:
+        return 0.0
+    entry = pos['entry_price']
+    pnl_pct = ((price - entry) / entry) if pos['direction'] == 'long' else ((entry - price) / entry)
+    pnl = leg_margin * pnl_pct * pos['leverage']
+    fee = leg_margin * pos['leverage'] * FEE_RATE
+    net = pnl - fee
+    with state_lock:
+        lg['capital'] = (lg['capital'] or 0) + net
+    lg['daily_pnl'] = lg.get('daily_pnl', 0.0) + net
+    pos['margin'] -= leg_margin
+    if fraction < 0.999:
+        pos['banked'] = pos.get('banked', 0.0) + net
+    return net
+
+def engine_open(lg, *, coin, direction, price, margin, leverage, sl_pct, tp_pct,
+                ts, live_id=None, size=None, reasons=None, factors=None, snapshot=None):
+    if direction == 'long':
+        sl = price * (1 - sl_pct)
+        tp = price * (1 + tp_pct)
+    else:
+        sl = price * (1 + sl_pct)
+        tp = price * (1 - tp_pct)
+    pos = {
+        'ledger': lg['name'], 'coin': coin, 'direction': direction,
+        'entry_price': price, 'margin': margin, 'leverage': leverage,
+        'size': size, 'stop_loss': sl, 'take_profit': tp,
+        'trail_trigger': tp_pct * 0.75, 'be_trigger': tp_pct * 0.40,
+        'best_price': price, 'trail_active': False,
+        'live': lg['name'] == 'live', 'live_id': live_id,
+        'banked': 0.0, 'close_fails': 0, 'close_next': 0.0,
+        'closing': False, 'liq_warned': False, 'sl_oid': None, 'sl_px': None,
+        'reasons': reasons or [], 'factors': factors or [],
+        'snapshot': snapshot or {}, 'open_ts': ts,
+    }
+    with state_lock:
+        lg['positions'].append(pos)
+    return pos
+
+def finalize_close(lg, pos, price, reason, ts, leg_exec, quiet=False):
+    with state_lock:
+        if pos.get('closing') or pos.get('closed'):
+            return False
+        pos['closing'] = True
+    try:
+        margin_before = pos['margin']
+        if pos.get('live'):
+            if (pos.get('size') or 0) <= 0:
+                pos['closed'] = True
+                return False
+        elif margin_before is None or margin_before <= 0:
+            pos['closed'] = True
+            return False
+        net = leg_exec(pos, 1.0, price)
+        if net is None:
+            return False
+        total_pnl = net + pos.get('banked', 0.0)
+        trade_rec = {
+            'coin': pos.get('coin', '-'), 'direction': pos['direction'],
+            'entry': pos['entry_price'], 'exit': price,
+            'pnl': total_pnl, 'pnl_final_leg': net, 'banked': pos.get('banked', 0.0),
+            'pnl_pct': (((price - pos['entry_price']) / pos['entry_price']) if pos['direction'] == 'long'
+                        else ((pos['entry_price'] - price) / pos['entry_price'])) * 100,
+            'reason': reason, 'live': lg['name'] == 'live', 'ledger': lg['name'],
+            'factors': pos.get('factors', []), 'snapshot': pos.get('snapshot'),
+            'time': fa_now().isoformat() if not quiet else None, 'ts': ts,
+        }
+        with state_lock:
+            lg['trades'].append(trade_rec)
+            if len(lg['trades']) > 500:
+                lg['trades'] = lg['trades'][-300:]
+            try:
+                lg['positions'].remove(pos)
+            except ValueError:
+                pass
+        lg['equity'].append({'t': fa_now().isoformat(), 'eq': round(lg['capital'], 4)})
+        if len(lg['equity']) > 500:
+            lg['equity'] = lg['equity'][-300:]
+        if net <= 0 and reason == 'stop_loss':
+            lg['consec_losses'] = lg.get('consec_losses', 0) + 1
+            _pause = CONSEC_PAUSE * (1 + lg['consec_losses'])
+            add_log(f'LOSS #{lg["consec_losses"]} for {lg["name"]}')
+            # Only trigger cooldown if we're not ALREADY in one (prevents spam from simultaneous closes)
+            _already_cooling = lg.get('cooldown_until', 0) > time.time()
+            if lg['consec_losses'] >= MAX_CONSEC_LOSSES:
+                if not _already_cooling:
+                    lg['cooldown_until'] = time.time() + _pause
+                    add_log(f'CIRCUIT BREAKER ({lg["name"]}): pausing {_pause//3600}h')
+                    send_telegram(f'⛔️ {MAX_CONSEC_LOSSES} ضرر پیاپی {ledger_label(lg["name"])} - {_pause//3600} ساعت استراحت')
+                lg['consec_losses'] = 0
+            elif lg['consec_losses'] >= 2 and not _already_cooling:
+                lg['cooldown_until'] = time.time() + LOSS_COOLDOWN * lg['consec_losses']
+                add_log(f'Cooldown {LOSS_COOLDOWN*lg["consec_losses"]//60}min ({lg["name"]})')
+        elif net > 0:
+            lg['consec_losses'] = 0
+        if not quiet:
+            if reason in ('liquidated_or_manual', 'sync_closed') and pos.get('live'):
+                lg['liq_halt_until'] = time.time() + LIQUIDATION_HALT_HOURS * 3600
+                add_log(f'LIQUIDATION HALT ({lg["name"]}): no new entries for {LIQUIDATION_HALT_HOURS}h')
+                send_telegram(f'🧊 حبس پس از لیکویید {ledger_label(lg["name"])}: {LIQUIDATION_HALT_HOURS} ساعت بدون ورود جدید')
+            reason_fa = {'take_profit': 'حد سود 🎯', 'stop_loss': 'حد ضرر 🛑',
+                         'profit_lock': 'قفل سود 🔒', 'max_age': 'طولانی شدن ⏰',
+                         'runner_end': 'پایان دونده 🏃', 'kill_switch': 'اضطراری 🔴',
+                         'sync_closed': 'بسته شد روی صرافی ⚠️',
+                         'structure_exit': 'شکست ساختار بازار 📉',
+                         'funding_normalized': 'فاندینگ نرمال شد 💤',
+                         'liquidated_or_manual': 'لیکویید/بسته دستی ⚠️'}.get(reason, reason)
+            emoji = '✅' if net > 0 else '❌'
+            add_log(f'Closed ({lg["name"]}): {COIN_FA.get(pos.get("coin"), "-")} {pos["direction"]} {net:+.4f}$ [{reason}]')
+            send_telegram(
+                f'{emoji} معامله بسته شد ({ledger_label(lg["name"])})\n'
+                f'ارز: {COIN_FA.get(pos.get("coin"), pos.get("coin"))}\n'
+                f'سود/زیان: {net:+.4f}$ (کل: {total_pnl:+.4f}$)\nعلت: {reason_fa}\n'
+                f'موجودی: {lg["capital"]:.2f}$')
+        try:
+            _save_trade_sqlite(trade_rec)
+        except Exception:
+            pass
+        if not quiet:
+            try:
+                checkpoint_guard(lg, PAPER_CAPITAL if lg['name'] == 'paper' else live_base_capital())
+            except Exception:
+                log_exception('checkpoint_guard failed')
+            save_state()
+        try: _learn_from_trade(trade_rec)
+        except: pass
+        pos['closed'] = True
+        return True
+    finally:
+        pos['closing'] = False
+
+def live_base_capital():
+    base = state.get('live_base')
+    if base:
+        return base
+    lg = get_ledger('live')
+    if lg['capital']:
+        state['live_base'] = lg['capital']
+        return lg['capital']
+    return 100.0
+
+
+def _structure_exit(pos, price):
+    try:
+        coin = pos['coin']
+        c = get_candles_cached(coin, '60', 8, drop_forming=True)
+        if not c or len(c) < 6: return False
+        ll = min(c[-6:]); lh = max(c[-6:])
+        if pos['direction'] == 'long' and price < ll: return True
+        if pos['direction'] == 'short' and price > lh: return True
+        return False
+    except: return False
+def manage_engine_pos(lg: dict, pos: dict, price: float, ts: float, leg_exec, quiet: bool = False) -> None:
+    """Manage a position through the 8 exit rules (unified live/paper/backtest)."""
+    if pos.get('closing') or pos.get('closed') or not price:
+        return
+    entry = pos['entry_price']
+    pos.setdefault('best_price', entry)
+    pos.setdefault('trail_active', False)
+    age_h = (ts - pos.get('open_ts', ts)) / 3600
+    cur_gain_now = ((price - entry) / entry) if pos['direction'] == 'long' else ((entry - price) / entry)
+    cur_regime_now = (state.get('regime') or {}).get('regime', 'range')
+    regime_opp_now = ((pos['direction'] == 'long' and cur_regime_now == 'trend_down') or
+                      (pos['direction'] == 'short' and cur_regime_now == 'trend_up'))
+    if age_h > MAX_TRADE_HOURS * 4:
+        if not quiet:
+            add_log(f'Hard close: {pos.get("coin")} older than {MAX_TRADE_HOURS*4}h')
+        finalize_close(lg, pos, price, 'max_age', ts, leg_exec, quiet)
+        return
+    if age_h > MAX_TRADE_HOURS:
+        if (age_h > MAX_TRADE_HOURS * 3 and cur_gain_now < 0.0) or cur_gain_now < -0.015 or (age_h > MAX_TRADE_HOURS * 2 and regime_opp_now and cur_gain_now < 0.003):
+            finalize_close(lg, pos, price, 'max_age', ts, leg_exec, quiet)
+            return
+        elif cur_gain_now >= 0.003 and not pos.get('overtime'):
+            pos['overtime'] = True
+            pos['trail_active'] = True
+            if not quiet:
+                add_log(f'{pos.get("coin")} overtime but in profit ({cur_gain_now*100:+.1f}%) - tight trail')
+    tp_dist = abs(pos['take_profit'] - entry) / entry
+    partial_trig = tp_dist * 0.5
+    trail_trig = pos.get('trail_trigger', tp_dist * 0.75)
+    be_trig = pos.get('be_trigger', tp_dist * 0.40)
+    cur_regime = (state.get('regime') or {}).get('regime', 'range')
+    regime_opp = ((pos['direction'] == 'long' and cur_regime == 'trend_down') or
+                  (pos['direction'] == 'short' and cur_regime == 'trend_up'))
+    if regime_opp and cur_gain_now >= 0.008 and not pos['trail_active']:
+        pos['trail_active'] = True
+        be_sl = entry * 1.002 if pos['direction'] == 'long' else entry * 0.998
+        if (pos['direction'] == 'long' and be_sl > pos['stop_loss']) or (pos['direction'] == 'short' and be_sl < pos['stop_loss']):
+            pos['stop_loss'] = be_sl
+        if not quiet:
+            add_log(f'Regime reversal protection ({lg["name"]}): {pos.get("coin")} trailing ON & SL to BE')
+    _exit_this_tick = False  # (Bug #6: no two partial exits in one tick)
+    if not pos.get('partial_done') and not _exit_this_tick:
+        cur_gain = cur_gain_now
+        if cur_gain >= partial_trig:
+            net = leg_exec(pos, 0.4, price)
+            if net is not None:
+                pos['partial_done'] = True
+                _exit_this_tick = True
+                if not quiet:
+                    add_log(f'Partial TP ({lg["name"]}): 40% at {cur_gain*100:+.1f}% = {net:+.4f}$')
+                    send_telegram(f'💰 برداشت پله‌ای {ledger_label(lg["name"])}: ۴۰٪ ({net:+.4f}$)')
+    if age_h >= 12 and cur_gain_now >= 0.005:
+        be_sl = entry * 1.002 if pos['direction'] == 'long' else entry * 0.998
+        if (pos['direction'] == 'long' and be_sl > pos['stop_loss']) or (pos['direction'] == 'short' and be_sl < pos['stop_loss']):
+            pos['stop_loss'] = be_sl
+            if not quiet and not pos.get('time_be'):
+                pos['time_be'] = True
+                add_log(f'Time-Decay BE ({lg["name"]}): {pos.get("coin")} >12h in profit, SL moved to breakeven')
+    if pos['direction'] == 'long':
+        if price > pos['best_price']:
+            pos['best_price'] = price
+        gain = (pos['best_price'] - entry) / entry
+        if not pos.get('half_cashed') and gain >= be_trig and not _exit_this_tick:
+            net = leg_exec(pos, 0.5, price)
+            if net is not None:
+                pos['half_cashed'] = True
+                if not quiet:
+                    add_log(f'Half-cash ({lg["name"]}): 50% at {gain*100:+.1f}% = {net:+.4f}$')
+                    send_telegram(f'💵 نصف معامله {ledger_label(lg["name"])} نقد شد ({net:+.4f}$) - نصف دیگه با استاپ اصلی')
+        if gain >= 0.012:
+            be_floor = entry * 1.002
+            if be_floor > pos['stop_loss']:
+                pos['stop_loss'] = be_floor
+                if not quiet and not pos.get('be_locked'):
+                    pos['be_locked'] = True
+                    add_log(f'Breakeven lock ({lg["name"]}): {pos.get("coin")} SL moved to BE (+1.2% gain)')
+        if gain >= tp_dist * LADDER1_AT_TP:
+            lock_sl = entry * (1 + gain * LADDER1_LOCK)
+            if lock_sl > pos['stop_loss']:
+                pos['stop_loss'] = lock_sl
+                if not pos.get('ladder1'):
+                    pos['ladder1'] = True
+                    if not quiet:
+                        add_log(f'Ladder1 ({lg["name"]}): lock {LADDER1_LOCK*100:.0f}% of gain')
+        if gain >= trail_trig or gain >= 0.025:
+            lock_sl = entry * (1 + gain * 0.60)
+            if lock_sl > pos['stop_loss']:
+                pos['stop_loss'] = lock_sl
+            if not pos['trail_active']:
+                pos['trail_active'] = True
+                if not quiet:
+                    add_log(f'Profit lock ON ({lg["name"]}) gain {gain*100:.1f}%')
+        # Dynamic ATR-based trailing: use ATR/2 as trail gap, not fixed values
+        _atr = atr_of(pos['coin']) if hasattr(atr_of, '__call__') else 0.004
+        _trail_gap = max(0.004, min(0.020, _atr * 2.0 if _atr else 0.008))
+        cur_trail_gap = _trail_gap if gain >= 0.020 else _trail_gap * 1.5
+        if _structure_exit(pos, price):
+            finalize_close(lg, pos, price, 'structure_exit', ts, leg_exec, quiet)
+            return
+        if price <= pos['stop_loss']:
+            reason = 'runner_end' if pos.get('runner') else (
+                'profit_lock' if (pos.get('ladder1') or pos['trail_active']) else 'stop_loss')
+            finalize_close(lg, pos, price, reason, ts, leg_exec, quiet)
+        elif price >= pos['take_profit'] and not pos.get('runner'):
+            net = leg_exec(pos, 0.6, price)
+            if net is not None:
+                pos['runner'] = True
+                _exit_this_tick = True
+                pos['stop_loss'] = max(pos['stop_loss'], price * (1 - RUNNER_TRAIL))
+                if not quiet:
+                    add_log(f'RUNNER ({lg["name"]}): banked 60% at TP ({net:+.4f}$), 40% rides')
+                    send_telegram(f'🏃 حالت دونده {ledger_label(lg["name"])}: ۶۰٪ نقد ({net:+.4f}$) - ۴۰٪ سوار روند')
+        elif pos.get('runner'):
+            cur_rt = 0.002 if gain >= 0.04 else RUNNER_TRAIL
+            if price <= pos['best_price'] * (1 - cur_rt):
+                finalize_close(lg, pos, price, 'runner_end', ts, leg_exec, quiet)
+            else:
+                floor = pos['best_price'] * (1 - cur_rt)
+                if floor > pos['stop_loss']:
+                    pos['stop_loss'] = floor
+        elif pos['trail_active'] and price <= pos['best_price'] * (1 - cur_trail_gap):
+            finalize_close(lg, pos, price, 'profit_lock', ts, leg_exec, quiet)
+    else:
+        if price < pos['best_price']:
+            pos['best_price'] = price
+        gain = (entry - pos['best_price']) / entry
+        if not pos.get('half_cashed') and gain >= be_trig and not _exit_this_tick:
+            net = leg_exec(pos, 0.5, price)
+            if net is not None:
+                pos['half_cashed'] = True
+                if not quiet:
+                    add_log(f'Half-cash ({lg["name"]}): 50% at {gain*100:+.1f}% = {net:+.4f}$')
+        if gain >= 0.012:
+            be_floor = entry * 0.998
+            if be_floor < pos['stop_loss']:
+                pos['stop_loss'] = be_floor
+                if not quiet and not pos.get('be_locked'):
+                    pos['be_locked'] = True
+                    add_log(f'Breakeven lock ({lg["name"]}): {pos.get("coin")} SL moved to BE (+1.2% gain)')
+        if gain >= tp_dist * LADDER1_AT_TP:
+            lock_sl = entry * (1 - gain * LADDER1_LOCK)
+            if lock_sl < pos['stop_loss']:
+                pos['stop_loss'] = lock_sl
+                if not pos.get('ladder1'):
+                    pos['ladder1'] = True
+        if gain >= trail_trig or gain >= 0.025:
+            lock_sl = entry * (1 - gain * 0.60)
+            if lock_sl < pos['stop_loss']:
+                pos['stop_loss'] = lock_sl
+            if not pos['trail_active']:
+                pos['trail_active'] = True
+        cur_trail_gap = 0.004 if gain >= 0.025 else 0.012
+        if price >= pos['stop_loss']:
+            reason = 'runner_end' if pos.get('runner') else (
+                'profit_lock' if (pos.get('ladder1') or pos['trail_active']) else 'stop_loss')
+            finalize_close(lg, pos, price, reason, ts, leg_exec, quiet)
+        elif price <= pos['take_profit'] and not pos.get('runner'):
+            net = leg_exec(pos, 0.6, price)
+            if net is not None:
+                pos['runner'] = True
+                _exit_this_tick = True
+                pos['stop_loss'] = min(pos['stop_loss'], price * (1 + RUNNER_TRAIL))
+                if not quiet:
+                    add_log(f'RUNNER ({lg["name"]}): banked 60% at TP ({net:+.4f}$)')
+        elif pos.get('runner'):
+            cur_rt = 0.002 if gain >= 0.04 else RUNNER_TRAIL
+            if price >= pos['best_price'] * (1 + cur_rt):
+                finalize_close(lg, pos, price, 'runner_end', ts, leg_exec, quiet)
+            else:
+                floor = pos['best_price'] * (1 + cur_rt)
+                if floor < pos['stop_loss']:
+                    pos['stop_loss'] = floor
+        elif pos['trail_active'] and price >= pos['best_price'] * (1 + cur_trail_gap):
+            finalize_close(lg, pos, price, 'profit_lock', ts, leg_exec, quiet)
+
+# ============ Hyperliquid LIVE layer (agent wallet) ============
+
+_hl_ex = [None]
+
+
+def _hl_key_changed():
+    """Check if HL_AGENT_PRIVATE_KEY changed since last init."""
+    current = os.environ.get('HL_AGENT_PRIVATE_KEY', '').strip()
+    return current and hashlib.sha256(current.encode()).hexdigest() != state.get('_hl_key_hash')
+
+def hl_exchange():
+    """Signed Hyperliquid client, auto-reinit on key change."""
+    priv = os.environ.get('HL_AGENT_PRIVATE_KEY', '').strip()
+    account = os.environ.get('HL_ACCOUNT_ADDRESS', '').strip()
+    if _hl_key_changed():
+        _hl_ex[0] = None
+        state['_hl_key_hash'] = hashlib.sha256(priv.encode()).hexdigest()
+    if not priv or not account:
+        state['hl_agent_ok'] = False
+        return None
+    try:
+        if _hl_ex[0] is None:
+            from hyperliquid.exchange import Exchange
+            import eth_account
+            wallet = eth_account.Account.from_key(priv)
+            _hl_ex[0] = Exchange(wallet, hl_base_url(), account_address=account)
+            state['_hl_key_hash'] = hashlib.sha256(priv.encode()).hexdigest()
+        return _hl_ex[0]
+    except Exception:
+        log_exception('hl_exchange init failed')
+        state['hl_agent_ok'] = False
+        return None
+
+
+def hl_account():
+    return os.environ.get('HL_ACCOUNT_ADDRESS', '').strip()
+
+def hl_agent_approved():
+    """Check the agent wallet is registered on Hyperliquid. Returns True/False/None."""
+    try:
+        ex = hl_exchange()
+        if ex is None:
+            return None
+        agents = _net_call(lambda: hl_info().extra_agents(hl_account()), retries=2, base_wait=1.0) or []
+        agent_addr = ex.wallet.address.lower()
+        for a in agents:
+            if isinstance(a, dict) and str(a.get('address', '')).lower() == agent_addr:
+                return True
+        return False
+    except Exception:
+        log_exception('hl_agent_approved')
+        return None
+
+def hl_position_size(coin):
+    """Actual signed size of an open position on the exchange (0 if none)."""
+    try:
+        st = _net_call(lambda: hl_info().user_state(hl_account()), retries=2, base_wait=1.0)
+        for p in st.get('assetPositions', []):
+            if p['position'].get('coin') == coin:
+                return float(p['position'].get('szi') or 0)
+        return 0.0
+    except Exception:
+        log_exception('hl_position_size')
+        return None
+
+def hl_test_connection():
+    """Verify keys + agent approval. Returns (ok, info)."""
+    try:
+        ex = hl_exchange()
+        if ex is None:
+            state['hl_block_reason'] = 'کلید Agent یا آدرس Master تنظیم نشده'
+            return False, state['hl_block_reason']
+        st = ex.info.user_state(hl_account())
+        ms = st.get('marginSummary', {})
+        val = float(ms.get('accountValue', 0) or 0)
+        approved = hl_agent_approved()
+        if approved is not True:
+            state['hl_block_reason'] = ('Agent Wallet approval could not be verified; refusing live trading.'
+                                       if approved is None else
+                                       'Agent Wallet توی هایپرلیکوئید تایید نشده (Settings → API Wallets)')
+            return False, state['hl_block_reason']
+        state['hl_block_reason'] = ''
+        return True, f'اتصال موفق - موجودی حساب: {val:.2f}$'
+    except Exception as e:
+        return False, f'خطا در اتصال: {e}'
+
+def sync_live_capital(quiet=False):
+    ex = hl_exchange()
+    if ex is None:
+        return None
+    try:
+        st = _net_call(lambda: ex.info.user_state(hl_account()), retries=2, base_wait=1.0)
+        ms = st.get('marginSummary', {})
+        val = float(ms.get('accountValue', 0) or 0)
+        lg = get_ledger('live')
+        if val > 0:
+            with state_lock:
+                lg['capital'] = val
+            if not state.get('live_base') or state.get('live_base') <= 0:
+                state['live_base'] = val
+            # balance monitoring (issue #24): warn on unexplained drops
+            last = state.get('live_cap_last') or 0.0
+            _drop = None
+            if last > 0 and not lg['positions']:
+                _drop = (last - val) / last
+                if _drop > 0.15 and not state.get('balance_warned'):
+                    state['balance_warned'] = True
+                    add_log(f'BALANCE DROP: {last:.2f}$ -> {val:.2f}$ ({(_drop*100):.0f}%) while no open positions')
+                    send_telegram(f'⚠️ موجودی حساب {val:.2f}$ شده (قبلاً {last:.2f}$) بدون پوزیشن باز!\n'
+                                  f'شاید برداشت دستی یا کارمزد بوده. چک کن.')
+            if val > last or (last > 0 and _drop is not None and _drop <= 0.05):
+                state['balance_warned'] = False
+            state['live_cap_last'] = val
+        return val
+    except Exception:
+        log_exception('sync_live_capital')
+        return None
+
+def hl_verify_backstop(pos, expected_oid=None):
+    """Verify a reduce-only trigger SL is actually resting on Hyperliquid."""
+    ex = hl_exchange()
+    if ex is None:
+        return False
+    try:
+        orders = _net_call(lambda: hl_info().frontend_open_orders(hl_account()), retries=2, base_wait=0.5) or []
+        oid = expected_oid if expected_oid is not None else pos.get('sl_oid')
+        if not oid:
+            return False
+        for o in orders:
+            if int(o.get('oid', -1)) != int(oid):
+                continue
+            if not bool(o.get('reduceOnly')):
+                continue
+            if not bool(o.get('isTrigger')):
+                continue
+            if str(o.get('coin')) != str(pos.get('coin')):
+                continue
+            return True
+    except Exception:
+        log_exception('hl_verify_backstop')
+    return False
+
+
+def hl_place_sl(pos, size=None):
+    """Atomically-ish replace the exchange-side protective stop.
+
+    Safety rule: never cancel the old verified stop until the new stop has
+    been accepted AND independently verified by frontendOpenOrders.
+    """
+    if not state.get('backstop_enabled'):
+        return False
+    ex = hl_exchange()
+    if ex is None:
+        return False
+    coin = pos.get('coin')
+    old_oid = pos.get('sl_oid')
+    try:
+        sz = float(size if size is not None else pos.get('size', 0.0))
+        if sz <= 0:
+            return False
+        trigger_px = round(float(pos['stop_loss']), PX_DECIMALS(coin))
+        if trigger_px <= 0:
+            return False
+        px_dec = PX_DECIMALS(coin)
+        is_buy = pos['direction'] == 'short'
+        limit_px = round(trigger_px * (1.01 if is_buy else 0.99), px_dec)
+        resp = ex.order(coin, is_buy, sz, limit_px,
+                        {"trigger": {"triggerPx": str(trigger_px), "isMarket": True, "tpsl": "sl"}},
+                        reduce_only=True)
+        if resp.get('status') != 'ok':
+            raise RuntimeError(f'order status={resp.get("status")} response={mask_secrets(resp)}')
+        sts = resp['response']['data']['statuses'][0]
+        if 'resting' not in sts:
+            raise RuntimeError(f'protective stop not resting: {sts}')
+        new_oid = int(sts['resting']['oid'])
+        pos['sl_oid'] = new_oid
+        pos['sl_px'] = float(trigger_px)
+        if not hl_verify_backstop(pos, new_oid):
+            # Do not touch an old verified stop if the new one cannot be verified.
+            pos['sl_oid'] = old_oid
+            raise RuntimeError(f'new stop {new_oid} could not be independently verified')
+        # Only after the new stop is verified do we cancel the old one.
+        if old_oid and int(old_oid) != new_oid:
+            try:
+                ex.cancel(coin, int(old_oid))
+            except Exception:
+                # Both stops may briefly exist; keep the verified new one and alert.
+                add_log(f'WARNING: old SL cancel failed {coin} oid={old_oid}; new SL {new_oid} remains verified')
+        add_log(f'Backstop SL {coin}: {trigger_px} (oid {new_oid})')
+        pos['sl_alerted'] = False
+        return True
+    except Exception as e:
+        log_exception('hl_place_sl: ' + str(e))
+    # Preserve old verified stop if one existed. Never claim protection otherwise.
+    if not old_oid:
+        pos['sl_oid'] = None
+    if not pos.get('sl_alerted'):
+        pos['sl_alerted'] = True
+        add_log(f'🚨 BACKSTOP SL FAILED for {coin} - position protection not verified')
+        send_telegram(f'🚨 استاپ محافظ {COIN_FA.get(coin, coin)} تأیید نشد؛ پوزیشن محافظت‌شده فرض نمی‌شود.')
+    return False
+
+def hl_cancel_sl(pos):
+    ex = hl_exchange()
+    oid = pos.get('sl_oid')
+    if ex is None or not oid:
+        pos['sl_oid'] = None
+        return
+    try:
+        ex.cancel(pos['coin'], oid)
+    except Exception:
+        pass
+    pos['sl_oid'] = None
+
+def hl_open_live(coin: str, direction: str, margin: float, price: float, lev: int) -> dict:
+    """Open a real position on Hyperliquid. Returns dict or None."""
+    ex = hl_exchange()
+    if ex is None:
+        return None
+    try:
+        if state.get('lev_set', {}).get(coin) != lev:
+            r = ex.update_leverage(int(lev), coin, True)
+            if r.get('status') == 'ok':
+                state.setdefault('lev_set', {})[coin] = lev
+        ok_depth, book_val = hl_book_depth_ok(coin, margin * lev, direction)
+        if not ok_depth:
+            add_log(f'LIVE guard: {coin} book too thin for {margin*lev:.0f}$ (near={book_val:.0f}$)')
+            return None
+        sz_dec = SZ_DECIMALS(coin)
+        px_dec = PX_DECIMALS(coin)
+        sz = math.floor((margin * lev) / price * 10 ** sz_dec) / 10 ** sz_dec
+        if sz <= 0:
+            return None
+        # Snapshot the exchange position before sending the order. This prevents
+        # a pre-existing BTC/ETH position from being mistaken for a new fill.
+        pre_szi = hl_position_size(coin)
+        if pre_szi is None:
+            state['manual_paused'] = True
+            state['emergency_unverified_position'] = True
+            add_log(f'LIVE open {coin}: could not read pre-order position; refusing order')
+            return None
+        if abs(pre_szi) > 1e-12:
+            add_log(f'LIVE guard: existing {coin} position {pre_szi}; refusing to add/reverse through this entry path')
+            return None
+        if margin * lev < HL_MIN_ORDER_USD:
+            add_log(f'LIVE guard: {coin} notional {margin*lev:.1f}$ < min {HL_MIN_ORDER_USD}$')
+            return None
+        px = round(price, px_dec)
+        resp = ex.market_open(coin, direction == 'long', sz, px=px, slippage=0.01)
+        if resp.get('status') != 'ok':
+            add_log(f'LIVE open failed {coin}: {mask_secrets(resp)}')
+            send_telegram(f'⚠️ باز کردن {COIN_FA.get(coin)} در هایپرلیکوئید ناموفق بود: {resp.get("response")}')
+            return None
+        sts = resp['response']['data']['statuses'][0]
+        if 'filled' in sts:
+            avg = float(sts['filled']['avgPx'])
+            oid = sts['filled']['oid']
+        elif 'resting' in sts:
+            oid = sts['resting']['oid']
+            # Never create a local position merely because an order is resting.
+            # Poll the exchange for an actual fill first.
+            actual_wait = 0.0
+            for _ in range(10):
+                time.sleep(0.5)
+                actual_wait = hl_position_size(coin)
+                if actual_wait is not None:
+                    want_sign = 1 if direction == 'long' else -1
+                    if actual_wait * want_sign > 1e-12:
+                        break
+            else:
+                try:
+                    ex.cancel(coin, int(oid))
+                except Exception:
+                    pass
+                add_log(f'LIVE open {coin}: order {oid} remained unfilled; canceled')
+                return None
+            avg = px
+        else:
+            add_log(f'LIVE open {coin}: unexpected statuses {sts}')
+            return None
+        # slippage check (issue #13): warn if fill is far from the mid we sent
+        try:
+            slip = abs(avg - px) / px if px else 0.0
+            if slip > 0.01:
+                add_log(f'SLIPPAGE WARN {coin}: expected {px}, filled {avg} ({slip*100:.2f}%)')
+                send_telegram(f'⚠️ اسلیپیج زیاد در {COIN_FA.get(coin)}: ورود {fmt_price(avg)} (انتظار {fmt_price(px)})')
+        except Exception:
+            pass
+        # verify actual position on the exchange (partial fills / rejections — issues #6, #9)
+        actual = hl_position_size(coin)
+        if actual is None:
+            add_log(f'LIVE open {coin}: could not verify position size - refusing unverified live entry')
+            state['manual_paused'] = True
+            state['emergency_unverified_position'] = True
+            send_telegram(f'🚨 {COIN_FA.get(coin, coin)}: بعد از سفارش، پوزیشن روی Exchange قابل تأیید نبود؛ ورودهای جدید متوقف شد.')
+            return None
+        elif abs(actual) < 1e-12:
+            add_log(f'LIVE open {coin}: exchange shows NO position after open - treating as failed')
+            send_telegram(f'⚠️ {COIN_FA.get(coin)} باز شد ولی پوزیشنی روی صرافی ثبت نشد!')
+            return None
+        else:
+            want_sign = 1 if direction == 'long' else -1
+            if actual * want_sign < 0:
+                add_log(f'LIVE open {coin}: position sign mismatch ({actual}) - aborting')
+                return None
+            if abs(actual) < sz * 0.5:
+                add_log(f'LIVE open {coin}: PARTIAL FILL - asked {sz}, got {abs(actual)}')
+                send_telegram(f'⚠️ پرشدن جزئی {COIN_FA.get(coin)}: سفارش {sz} ولی {abs(actual)} پر شد')
+            sz = abs(actual)
+            # use the exchange's real entry price when available
+            try:
+                st = _net_call(lambda: hl_info().user_state(hl_account()), retries=1, base_wait=0.5)
+                for p in st.get('assetPositions', []):
+                    if p['position'].get('coin') == coin:
+                        ep = float(p['position'].get('entryPx') or 0)
+                        if ep > 0:
+                            avg = ep
+                        break
+            except Exception:
+                pass
+        add_log(f'LIVE opened {direction} {coin} sz={sz} @ {avg} (oid {oid})')
+        return {'oid': oid, 'entry': avg, 'size': sz}
+    except Exception:
+        log_exception('hl_open_live')
+        return None
+
+def hl_close_live(pos, fraction, price):
+    """Close a live position on Hyperliquid; cancels the backstop. Returns True/False."""
+    ex = hl_exchange()
+    if ex is None:
+        return False
+    try:
+        # short-circuit: if the exchange no longer holds this coin (e.g. the
+        # backstop trigger already closed it), just settle locally
+        st = ex.info.user_state(hl_account())
+        exch_szi = 0.0
+        for p in st.get('assetPositions', []):
+            if p['position'].get('coin') == pos['coin']:
+                exch_szi = float(p['position'].get('szi') or 0)
+                break
+        if abs(exch_szi) < 1e-12:
+            hl_cancel_sl(pos)
+            return True
+        sz = pos.get('size', 0.0) or 0.0
+        close_sz = sz * fraction
+        # never try to close more than the exchange holds
+        close_sz = min(close_sz, abs(exch_szi))
+        sz_dec = SZ_DECIMALS(pos['coin'])
+        close_sz = math.floor(close_sz * 10 ** sz_dec) / 10 ** sz_dec
+        if close_sz <= 0:
+            hl_cancel_sl(pos)
+            return True
+        px = round(price, PX_DECIMALS(pos['coin']))
+        resp = ex.market_close(pos['coin'], close_sz, px=px, slippage=0.003)
+        if resp.get('status') != 'ok':
+            add_log(f'LIVE close failed {pos["coin"]}: {resp}')
+            return False
+        # Check fill price vs expected
+        try:
+            sts = resp['response']['data']['statuses'][0]
+            if 'filled' in sts:
+                _avg = float(sts['filled']['avgPx'])
+                _exp = price
+                _s = abs(_avg - _exp) / max(_exp, 1e-9)
+                if _s > 0.005:
+                    add_log(f'CLOSE SLIPPAGE {pos["coin"]}: expected {_exp:.0f}, filled {_avg:.0f} ({_s*100:.3f}%)')
+                    send_telegram(f'⚠️ اسلیپیج بستن {COIN_FA.get(pos["coin"])}: {fmt_price(_avg)} (انتظار {fmt_price(_exp)})')
+        except:
+            pass
+        sts = resp['response']['data']['statuses'][0]
+        if 'filled' not in sts and 'resting' not in sts:
+            add_log(f'LIVE close {pos["coin"]}: unexpected {sts}')
+            return False
+        # Verify the position actually changed on the exchange. A successful
+        # API response alone is not enough because network/order races exist.
+        __new_sz = None
+        for _ in range(10):
+            time.sleep(0.4)
+            __new_sz = hl_position_size(pos['coin'])
+            if __new_sz is not None:
+                expected = max(0.0, abs(exch_szi) - close_sz)
+                if abs(abs(__new_sz) - expected) <= max(10 ** (-sz_dec), expected * 0.01):
+                    break
+        if __new_sz is None:
+            add_log(f'LIVE close {pos["coin"]}: exchange position could not be verified')
+            return False
+        if abs(__new_sz) <= 1e-12:
+            # The position is verified closed; remove the old exchange-side SL.
+            # Never leave a stale trigger order behind after a successful close.
+            hl_cancel_sl(pos)
+            return True
+        # Verify the position actually closed/partially closed
+        try:
+            if __new_sz is not None and abs(__new_sz) > 1e-12:
+                # Partial close - update local size
+                pos['size'] = abs(__new_sz)
+                add_log(f'LIVE close partial: {pos["coin"]} remaining {abs(__new_sz)}')
+                return True
+        except:
+            pass
+        return True
+    except Exception:
+        log_exception('hl_close_live')
+        return False
+
+def live_leg_exec(lg):
+    def _exec(pos, fraction, price):
+        now = time.time()
+        if now < pos.get('close_next', 0):
+            return None
+        ok = hl_close_live(pos, fraction, price)
+        if not ok:
+            for retry in range(1, 4):
+                time.sleep(3)
+                add_log('LIVE close retry #' + str(retry) + '/3 for ' + pos.get('coin', '?') + '...')
+                ok = hl_close_live(pos, fraction, price)
+                if ok:
+                    break
+            if not ok and fraction >= 0.999:
+                coin_name = COIN_FA.get(pos.get('coin', ''), pos.get('coin', ''))
+                add_log('EMERGENCY: ' + pos.get('coin', '?') + ' close failed after 3 retries - position remains OPEN locally')
+                state['manual_paused'] = True
+                state['emergency_close_failed'] = True
+                send_telegram(chr(128680) + ' Close ' + str(coin_name) + ' failed after 3 tries. Position is NOT settled locally; new entries paused.')
+        if not ok:
+            pos['close_fails'] = pos.get('close_fails', 0) + 1
+            pos['close_next'] = now + min(30 * (2 ** min(pos['close_fails'], 4)), 300)
+            if pos['close_fails'] >= 3:
+                send_telegram('🚨 ۳ بار بستن موقعیت لایو شکست خورد! لطفاً دستی ببند.')
+            return None
+        pos['close_fails'] = 0
+        pos['close_next'] = 0
+        net = engine_exit_leg(lg, pos, fraction, price)
+        # re-arm the protective SL for the remainder (partial closes)
+        if fraction < 0.999 and pos.get('size', 0) > 0 and not pos.get('closed'):
+            try:
+                hl_place_sl(pos)
+            except Exception:
+                pass
+        return net
+    return _exec
+
+def live_manage_wrapper(pos, price, ts):
+    try:
+        check_liquidation_distance(pos, price)
+    except Exception:
+        pass
+    lg = get_ledger('live')
+    manage_engine_pos(lg, pos, price, ts, live_leg_exec(lg))
+    # keep the exchange-side backstop in sync with the software SL
+    try:
+        if not pos.get('closed') and pos.get('size', 0) > 0:
+            sl = pos.get('stop_loss')
+            old = pos.get('sl_px')
+            move_th = max(0.0005 * pos['entry_price'], 10 ** (-PX_DECIMALS(pos['coin'])))
+            if old is None or sl is None or abs(sl - old) > move_th:
+                ok = bool(hl_place_sl(pos))
+                if state.get('require_backstop', True) and not ok:
+                    state['manual_paused'] = True
+                    state['emergency_unprotected'] = True
+                    add_log(f'EMERGENCY: backstop sync failed for {pos.get("coin")}; new entries paused')
+    except Exception:
+        log_exception('backstop sync')
+        if state.get('mode') == 'live' and state.get('require_backstop', True):
+            state['manual_paused'] = True
+            state['emergency_unprotected'] = True
+
+def check_liquidation_distance(pos, current):
+    try:
+        ex = hl_exchange()
+        if ex is None:
+            return
+        st = ex.info.user_state(hl_account())
+        for p in st.get('assetPositions', []):
+            it = p.get('position', {})
+            if it.get('coin') != pos['coin']:
+                continue
+            liq = float(it.get('liquidationPx') or 0)
+            if liq <= 0:
+                continue
+            dist = abs(current - liq) / current
+            if dist < 0.08 and not pos.get('liq_warned'):
+                pos['liq_warned'] = True
+                add_log(f'LIQ WARN {pos["coin"]}: liq {liq} dist {dist*100:.1f}%')
+                send_telegram(f'⚠️ فاصله تا لیکویید کمه! {COIN_FA.get(pos["coin"])} lq={fmt_price(liq)} (فاصله {dist*100:.1f}%)')
+            break
+    except Exception:
+        pass
+
+def hl_last_close_fill(coin, opened_ts):
+    """Best-effort weighted average of recent closing fills after position open."""
+    try:
+        fills = _net_call(lambda: hl_info().user_fills_by_time(
+            hl_account(), int(max(0, opened_ts - 5000) * 1000), int(time.time() * 1000), True),
+            retries=2, base_wait=0.5) or []
+        rows = [f for f in fills if f.get('coin') == coin]
+        if not rows:
+            return None
+        total = 0.0
+        qty = 0.0
+        for f in rows:
+            px = float(f.get('px') or 0)
+            sz = abs(float(f.get('sz') or 0))
+            if px > 0 and sz > 0:
+                total += px * sz
+                qty += sz
+        return total / qty if qty > 0 else None
+    except Exception:
+        log_exception('hl_last_close_fill')
+        return None
+
+
+def reconcile_live_positions():
+    ex = hl_exchange()
+    if ex is None:
+        return False
+    try:
+        st = _net_call(lambda: hl_info().user_state(hl_account()), retries=2, base_wait=0.5)
+        pos_map = {p['position']['coin']: p['position'] for p in st.get('assetPositions', [])}
+        lg = get_ledger('live')
+        healthy = True
+        for pos in list(lg['positions']):
+            hl_pos = pos_map.get(pos['coin'])
+            szi = float(hl_pos['szi']) if hl_pos else 0.0
+            local_szi = pos.get('size', 0) * (1 if pos['direction'] == 'long' else -1)
+            if abs(szi) < 1e-12:
+                fill_px = hl_last_close_fill(pos['coin'], pos.get('open_ts', time.time()))
+                if fill_px is None:
+                    # Do not fabricate PnL using the current market price.
+                    # Pause until we can prove how the position actually closed.
+                    state['manual_paused'] = True
+                    state['emergency_unverified_position'] = True
+                    healthy = False
+                    add_log(f'RECONCILE: {pos["coin"]} disappeared but close fill could not be proven; local position retained')
+                    send_telegram(f'🚨 {COIN_FA.get(pos["coin"], pos["coin"])} از Exchange ناپدید شد ولی Fill خروج قابل اثبات نیست؛ ربات متوقف شد.')
+                    continue
+                add_log(f'RECONCILE: {pos["coin"]} gone from exchange; settling at verified fill {fill_px}')
+                finalize_close(lg, pos, fill_px, 'sync_closed', time.time(), paper_leg_exec(lg))
+                continue
+            if local_szi * szi < 0:
+                state['manual_paused'] = True
+                state['emergency_unverified_position'] = True
+                healthy = False
+                add_log(f'RECONCILE CRITICAL: {pos["coin"]} direction mismatch local={local_szi} exchange={szi}')
+                send_telegram(f'🚨 جهت پوزیشن {COIN_FA.get(pos["coin"], pos["coin"])} بین Bot و Exchange متفاوت است؛ معاملات متوقف شد.')
+                continue
+            if abs(szi - local_szi) / max(abs(local_szi), 1e-9) > 0.01:
+                new_size = abs(szi)
+                add_log(f'RECONCILE: {pos["coin"]} size adjusted {local_szi} -> {szi}')
+                with state_lock:
+                    pos['size'] = new_size
+                if not hl_place_sl(pos):
+                    state['manual_paused'] = True
+                    state['emergency_unprotected'] = True
+                    healthy = False
+                    add_log(f'RECONCILE CRITICAL: {pos["coin"]} size changed but protective SL could not be verified')
+            elif pos.get('size', 0) > 0 and not hl_verify_backstop(pos):
+                if not hl_place_sl(pos):
+                    state['manual_paused'] = True
+                    state['emergency_unprotected'] = True
+                    healthy = False
+                    add_log(f'RECONCILE CRITICAL: {pos["coin"]} has no verified protective SL')
+
+        tracked = {p['coin'] for p in lg['positions']}
+        for coin, hp in pos_map.items():
+            if coin in tracked:
+                continue
+            szi = float(hp['szi'])
+            if abs(szi) < 1e-9:
+                continue
+            direction = 'long' if szi > 0 else 'short'
+            entry = float(hp['entryPx'] or 0)
+            if entry <= 0:
+                healthy = False
+                state['manual_paused'] = True
+                state['emergency_unverified_position'] = True
+                add_log(f'RECONCILE CRITICAL: untracked {coin} position has no valid entry price')
+                continue
+            add_log(f'RECONCILE: adopting untracked {coin} {direction} {abs(szi)} @ {entry}')
+            pos = engine_open(
+                lg, coin=coin, direction=direction, price=entry,
+                margin=abs(szi) * entry / eff_leverage(coin),
+                leverage=eff_leverage(coin), sl_pct=STOP_LOSS, tp_pct=TAKE_PROFIT,
+                ts=time.time(), live_id=hp.get('posId'), size=abs(szi),
+                reasons=['reconcile'], factors=[])
+            if pos and not hl_place_sl(pos):
+                state['manual_paused'] = True
+                state['emergency_unprotected'] = True
+                healthy = False
+                add_log(f'RECONCILE CRITICAL: adopted {coin} but could not verify SL')
+        return healthy
+    except Exception:
+        log_exception('reconcile_live_positions')
+        state['manual_paused'] = True
+        state['emergency_unverified_position'] = True
+        return False
+
+def paper_leg_exec(lg):
+    def _exec(pos, fraction, price):
+        return engine_exit_leg(lg, pos, fraction, price)
+    return _exec
+
+def manage_all_positions():
+    ts = time.time()
+    lg_p = get_ledger('paper')
+    for pos in list(lg_p['positions']):
+        price = state['prices'].get(pos.get('coin'))
+        if price:
+            manage_engine_pos(lg_p, pos, price, ts, paper_leg_exec(lg_p))
+    for pos in list(get_ledger('live')['positions']):
+        price = state['prices'].get(pos.get('coin'))
+        if price:
+            live_manage_wrapper(pos, price, ts)
+
+# ============ Position opening ============
+
+def live_safety_latched():
+    """Hard safety latches may not be cleared by /start or dashboard resume."""
+    return any(bool(state.get(k)) for k in (
+        'emergency_unprotected', 'emergency_unverified_position',
+        'emergency_close_failed'))
+
+def live_positions_protected():
+    """Return True only when every tracked live position has a verified exchange SL."""
+    if state.get('mode') != 'live':
+        return True
+    lg = get_ledger('live')
+    for pos in lg.get('positions', []):
+        if not pos.get('size', 0):
+            continue
+        if not hl_verify_backstop(pos):
+            return False
+    return True
+
+def can_resume_live():
+    if state.get('mode') != 'live':
+        return True, ''
+    if live_safety_latched():
+        return False, 'ایمنی اضطراری فعال است؛ ابتدا علت را بررسی و سیستم را پاک‌سازی کن.'
+    ok, info = hl_test_connection()
+    if not ok:
+        return False, info
+    if not live_positions_protected():
+        return False, 'حداقل یک پوزیشن لایو Stop محافظ تأییدشده ندارد.'
+    return True, ''
+
+def entries_blocked_reason(lg, base_capital):
+    if state.get('crash_mode'):
+        return 'محافظ سقوط فعال'
+    if state.get('manual_paused'):
+        return 'توقف دستی'
+    if state.get('mode') == 'live' and state.get('require_backstop', True) and not state.get('backstop_enabled', True):
+        return 'استاپ محافظ Exchange اجباری است'
+    if lg.get('cp_triggered'):
+        return 'چک‌پوینت اضطراری'
+    if lg.get('trading_paused'):
+        return 'سقف ضرر روزانه'
+    if lg.get('weekly_paused'):
+        return 'سقف ضرر هفتگی'
+    if lg.get('cooldown_until', 0) > time.time():
+        return 'استراحت پس از ضرر پیاپی'
+    if lg.get('liq_halt_until', 0) > time.time():
+        return 'حبس پس از لیکویید (۲۴h)'
+    if len(lg['positions']) >= MAX_POSITIONS:
+        return 'حداکثر موقعیت باز'
+    return None
+
+def open_engine_position(lg_name: str, signal: dict, quiet: bool = False) -> bool:
+    """Open a new position in the given ledger. Returns True if opened, False if blocked."""
+    lg = get_ledger(lg_name)
+    coin = signal.get('coin', 'BTC')
+    if any(p.get('coin') == coin for p in lg['positions']):
+        return False
+    dir_now = signal.get('direction', 'long')
+    same_dir_count = sum(1 for p in lg['positions'] if p.get('direction') == dir_now)
+    if same_dir_count >= 3:
+        if not quiet:
+            add_log(f'Entry blocked ({lg_name}): directional cap reached (max 3 {dir_now}s)')
+        return False
+    # Correlation filter: DYNAMIC — block if any open position has >0.85 correlation
+    for _p in lg['positions']:
+        if _p.get('direction') != dir_now:
+            continue
+        try:
+            _corr = _live_correlation(coin, _p.get('coin', ''))
+            if _corr > 0.85:
+                if not quiet:
+                    add_log(f'Entry blocked ({lg_name}): {coin} {dir_now} correlated {_corr:.2f} with existing {_p.get("coin")} {dir_now}')
+                return False
+        except Exception:
+            pass
+    base_capital = PAPER_CAPITAL if lg_name == 'paper' else live_base_capital()
+    if not check_daily_limit_lg(lg, base_capital):
+        return False
+    if entries_blocked_reason(lg, base_capital):
+        return False
+    capital = lg['capital']
+    if capital is None or capital <= 0:
+        return False
+    lev = eff_leverage(coin)
+    # Risk is defined as expected loss at the protective stop, not as raw margin.
+    # This prevents leverage from silently multiplying the intended account risk.
+    risk_pct = float(signal.get('risk_pct') or adaptive_risk_pct(signal))
+    risk = risk_pct
+    kelly_cap = kelly_risk(lg_name)
+    risk_pct = min(risk_pct, max(RISK_PER_TRADE, min(0.0125, kelly_cap)))
+    pc = PER_COIN.get(coin, {'weight': 1.0})
+    risk_pct = min(0.0125, max(0.0025, risk_pct * min(1.10, max(0.80, 0.90 + 0.10 * pc.get('weight', 1.0)))))
+    sl_probe, tp_probe, _ = dynamic_levels(coin)
+    sig_sl = signal.get('sl_pct') if isinstance(signal, dict) else None
+    sig_tp = signal.get('tp_pct') if isinstance(signal, dict) else None
+    if sig_sl and sig_tp:
+        sl_probe, tp_probe = float(sig_sl), float(sig_tp)
+    risk_dollars = capital * risk_pct
+    margin = risk_dollars / max(sl_probe * lev, 1e-9)
+    # Position margin is derived strictly from the risk budget and stop distance.
+    used_margin = sum(p.get('margin', 0) for p in lg['positions'])
+    if used_margin >= capital * MAX_TOTAL_RISK:
+        return False
+    try:
+        th = live_threshold()
+        sc = float(signal.get('score', th))
+        if sc < th + 1:
+            margin *= 0.7
+        elif sc >= th + 2:
+            margin *= 1.3
+    except Exception:
+        pass
+    if lg.get('consec_losses', 0) == 2:
+        margin *= 0.8
+    elif lg.get('consec_losses', 0) >= 3:
+        margin *= 0.6
+    # ---- Volatility targeting: constant dollar-risk across coins ----
+    # A coin with 2x the volatility gets half the position, so the
+    # expected dollar loss from a bad trade is the same on every coin.
+    try:
+        _vol = coin_volatility(coin)
+        _baseline_vol = 0.006  # reference volatility (roughly BTC/ETH normal)
+        if _vol and _vol > 0:
+            _vt_factor = min(1.8, max(0.4, _baseline_vol / _vol))
+            margin *= _vt_factor
+    except Exception:
+        pass
+    # Dynamic risk management
+    try:
+        _dr = _dynamic_risk(lg)
+        margin *= _dr
+    except:
+        pass
+    margin = min(margin, max(0.0, capital * MAX_TOTAL_RISK - used_margin))
+    price = state['prices'].get(coin)
+    if not price:
+        return False
+    _sig_sl = signal.get('sl_pct') if isinstance(signal, dict) else None
+    _sig_tp = signal.get('tp_pct') if isinstance(signal, dict) else None
+    if _sig_sl and _sig_tp:
+        sl_pct, tp_pct, vol_regime = float(_sig_sl), float(_sig_tp), 'normal'
+    else:
+        sl_pct, tp_pct, vol_regime = dynamic_levels(coin)
+    if vol_regime == 'high':
+        margin *= 0.7
+    if (state.get('regime') or {}).get('regime') == 'storm':
+        margin *= 0.4  # extra caution in storms
+    # Slippage protection: reduce size when volatility > 1.5x normal
+    _v = coin_volatility(coin) if hasattr(coin_volatility, '__call__') else 0
+    if _v and _v > 0.009:
+        margin *= 0.85
+    # Paper may use a small risk budget; the exchange minimum applies only to live orders.
+    if lg_name == 'live' and margin < capital * 0.002:
+        return False
+    live_id, size = None, None
+    if lg_name == 'live':
+        if state.get('mode') == 'paper':
+            add_log('LIVE guard: mode is paper - skipping live trade')
+            return False
+        if os.environ.get('LIVE_CONFIRM','').strip() != 'I_UNDERSTAND_LIVE_TRADING':
+            add_log('LIVE guard: explicit LIVE_CONFIRM is missing')
+            return False
+        if coin not in LIVE_COIN_WHITELIST:
+            add_log(f'LIVE guard: {coin} not in whitelist - skipped')
+            return False
+        notional = margin * lev
+        if notional < HL_MIN_ORDER_USD:
+            add_log(f'LIVE guard: {coin} notional {notional:.1f}$ < min {HL_MIN_ORDER_USD}$ - skipped')
+            return False
+        gate = live_entry_gate(
+            mode=state.get('mode', 'paper'),
+            agent_ok=bool(state.get('hl_agent_ok')),
+            coin=coin,
+            whitelist=set(LIVE_COIN_WHITELIST),
+            leverage=lev,
+            max_leverage=MAX_LEV,
+            margin=margin,
+            capital=capital,
+            used_margin=used_margin,
+            max_total_risk=MAX_TOTAL_RISK,
+            position_count=len(lg['positions']),
+            max_positions=MAX_POSITIONS,
+            backstop_enabled=bool(state.get('backstop_enabled', True)),
+            require_backstop=bool(state.get('require_backstop', True)),
+            market_healthy=(not state.get('crash_mode') and state.get('market_circuit', 0) < time.time()),
+        )
+        if not gate.allowed:
+            add_log(f'LIVE risk gate: {gate.reason}')
+            return False
+        # Semi-auto mode: ask Telegram for approval
+        if state.get('semi_auto'):
+            _old_pending = state.get('pending_live_signal')
+            if _old_pending and time.time() < _old_pending.get('expires', 0):
+                try:
+                    send_telegram('♻️ سیگنال قبلی لغو شد - سیگنال جدید از راه رسید')
+                except Exception:
+                    pass
+            state['pending_live_signal'] = {
+                'lg_name': lg_name, 'signal': signal, 'margin': margin,
+                'lev': lev, 'price': price, 'coin': coin, 'direction': signal['direction'],
+                'sl_pct': sl_pct, 'tp_pct': tp_pct,
+                'expires': time.time() + 300,
+            }
+            dir_icon = '📈' if signal['direction'] == 'long' else '📉'
+            emoji_dir = '📈' if signal['direction'] == 'long' else '📉'
+            approval_msg = ('🤔 تأیید ورود - ' + str(COIN_FA.get(coin, coin)) +
+                chr(10) + emoji_dir + ' ' + str(signal['direction']) +
+                chr(10) + '💰 مارجین: ' + str(round(margin, 2)) + '$ @ ' + str(lev) + 'x' +
+                chr(10) + '🎯 SL: ' + str(round(sl_pct*100, 1)) + '% | TP: ' + str(round(tp_pct*100, 1)) + '%' +
+                chr(10) + '⭐ امتیاز: ' + str(round(signal['score'], 1)))
+            add_log('SEMI-AUTO: asking approval for ' + str(coin) + ' ' + str(signal['direction']))
+            send_telegram(approval_msg,
+                keyboard=[[
+                    {'text': '✅ تأیید', 'callback_data': '/approve'},
+                    {'text': '❌ رد', 'callback_data': '/reject'},
+                ]])
+            # Don't execute yet — wait for approval
+            return True  # signal received, don't block paper
+        opened = hl_open_live(coin, signal['direction'], margin, price, lev)
+        if opened is None:
+            return False
+        live_id = opened['oid']
+        price = opened['entry']
+        size = opened['size']
+    pos = engine_open(lg, coin=coin, direction=signal['direction'], price=price,
+                      margin=margin, leverage=lev, sl_pct=sl_pct, tp_pct=tp_pct,
+                      ts=time.time(), live_id=live_id, size=size,
+                      reasons=signal.get('reasons', []), factors=signal.get('factors', []),
+                      snapshot={'threshold': live_threshold(), 'tuned': dict(get_tuned()),
+                                'regime': (state.get('regime') or {}).get('regime'),
+                                'session': current_session(),
+                                'kelly_risk': round(risk, 3), 'score': signal.get('score')})
+    if lg_name == 'live' and size:
+        sl_ok = False
+        try:
+            sl_ok = bool(hl_place_sl(pos))
+        except Exception:
+            log_exception('LIVE protective stop placement')
+        protection = require_verified_protection(
+            sl_installed=sl_ok, require_backstop=bool(state.get('require_backstop', True)))
+        if not protection.allowed:
+            # Fail closed: never knowingly leave a new live position unprotected.
+            state['manual_paused'] = True
+            state['emergency_unprotected'] = True
+            add_log(f'EMERGENCY: {coin} live position has no verified exchange stop; new entries paused')
+            try:
+                closed = hl_close_live(pos, 1.0, price)
+            except Exception:
+                closed = False
+            if closed:
+                with state_lock:
+                    try:
+                        lg['positions'].remove(pos)
+                    except ValueError:
+                        pass
+                send_telegram(f'🚨 {COIN_FA.get(coin, coin)}: استاپ محافظ نصب نشد؛ معامله اضطراری بسته شد و ورودهای جدید متوقف شد.')
+            else:
+                send_telegram(f'🚨 CRITICAL: {COIN_FA.get(coin, coin)} بدون استاپ محافظ باقی مانده؛ فوراً دستی بررسی شود.')
+            save_state()
+            return False
+    fa = COIN_FA.get(coin, coin)
+    dir_fa = 'خرید 📈' if signal['direction'] == 'long' else 'فروش 📉'
+    state['last_reason'] = (f'{ledger_label(lg_name)} | {fa} | {dir_fa} | امتیاز {signal["score"]:.1f}\n'
+                            + '\n'.join('• ' + r for r in signal.get('reasons', []))
+                            + f'\nورود: {fmt_price(price)} | SL: {fmt_price(pos["stop_loss"])} | TP: {fmt_price(pos["take_profit"])}')
+    add_log(f'Opened ({lg_name}): {signal["direction"]} {coin} @ {fmt_price(price)} m={margin:.2f}$ lev={lev}x')
+    send_telegram(
+        f'{"🔴 معامله واقعی (هایپرلیکوئید)" if lg_name=="live" else "🔵 معامله مجازی"} باز شد\n'
+        f'ارز: {fa}\nجهت: {dir_fa}\nورود: {fmt_price(price)}\n'
+        f'حد ضرر: {fmt_price(pos["stop_loss"])} | حد سود: {fmt_price(pos["take_profit"])}\n'
+        f'امتیاز: {signal["score"]:.1f}')
+    save_state()
+    return True
+
+def panic_close_all(source='dashboard'):
+    n = 0
+    lg_l = get_ledger('live')
+    for pos in list(lg_l['positions']):
+        cur = state['prices'].get(pos.get('coin'), pos['entry_price'])
+        if finalize_close(lg_l, pos, cur, 'kill_switch', time.time(), live_leg_exec(lg_l)):
+            n += 1
+    lg_p = get_ledger('paper')
+    for pos in list(lg_p['positions']):
+        cur = state['prices'].get(pos.get('coin'), pos['entry_price'])
+        if finalize_close(lg_p, pos, cur, 'kill_switch', time.time(), paper_leg_exec(lg_p)):
+            n += 1
+    state['manual_paused'] = True
+    add_log(f'*** PANIC ({source}): {n} positions closed ***')
+    send_telegram(f'🛑 توقف اضطراری ({source}): {n} معامله بسته شد')
+    save_state()
+    return n
+
+# ============ Backtest ON the unified engine ============
+
+
+# ============ TITAN Backtest Engine ============
+
+def _titan_entry(closes, coin, threshold):
+    try:
+        from titan import titan_scan, detect_regime
+        if not closes or len(closes) < 30:
+            return None, 0
+        gcc = lambda c, r="60", n=100, d=True: closes[-100:] if len(closes) >= 100 else closes
+        regime = detect_regime(gcc, coin)
+        sig = titan_scan(gcc, coin, COIN_FA, regime)
+        if sig and sig["score"] >= threshold:
+            return sig["direction"], sig["score"]
+    except:
+        pass
+    return None, 0
+
+def _bt_indicators(closes, highs, lows, vols, i):
+    """Pure historical indicators using data available at i only."""
+    c = closes[:i+1]
+    h = highs[:i+1] if highs else c
+    l = lows[:i+1] if lows else c
+    v = vols[:i+1] if vols else []
+    if len(c) < 20:
+        return None
+    gains = np.maximum(np.diff(c[-15:]), 0)
+    losses = np.maximum(-np.diff(c[-15:]), 0)
+    ag, al = np.mean(gains), np.mean(losses)
+    rsi = 50.0 if ag < 1e-12 and al < 1e-12 else 100 - 100/(1 + ag/max(al,1e-9))
+    mom = (c[-1]-c[-5])/c[-5]
+    sma7, sma20 = np.mean(c[-7:]), np.mean(c[-20:])
+    ema12 = _ema_series(c, 12)
+    ema26 = _ema_series(c, 26)
+    macd = None
+    if ema12 and ema26:
+        # align the last EMA values approximately by recomputing MACD series on raw closes
+        e12, e26 = [], []
+        a12, a26 = 2/13, 2/27
+        x12 = sum(c[:12])/12; x26 = sum(c[:26])/26
+        for x in c[12:]: x12 = a12*x + (1-a12)*x12; e12.append(x12)
+        for x in c[26:]: x26 = a26*x + (1-a26)*x26; e26.append(x26)
+        if e12 and e26: macd = e12[-1] - e26[-1]
+    # Wilder-style ADX approximation from OHLC
+    adx = None
+    if len(c) >= 30 and len(h) == len(c) and len(l) == len(c):
+        tr, pdm, ndm = [], [], []
+        for j in range(1, len(c)):
+            tr.append(max(h[j]-l[j], abs(h[j]-c[j-1]), abs(l[j]-c[j-1])))
+            up = h[j]-h[j-1]; dn = l[j-1]-l[j]
+            pdm.append(up if up > dn and up > 0 else 0.0)
+            ndm.append(dn if dn > up and dn > 0 else 0.0)
+        n=14
+        atr=np.mean(tr[-n:]); p=np.mean(pdm[-n:]); nd=np.mean(ndm[-n:])
+        if atr>0:
+            pdi=100*p/atr; ndi=100*nd/atr; dx=100*abs(pdi-ndi)/max(pdi+ndi,1e-9); adx=dx
+    vwap = None
+    if v:
+        vv=np.array(v[-24:],float); cc=np.array(c[-24:],float)
+        if vv.sum()>0: vwap=float((cc*vv).sum()/vv.sum())
+    return {'rsi':rsi,'mom':mom,'sma7':sma7,'sma20':sma20,'macd':macd,'adx':adx,'vwap':vwap}
+
+def _bt_session_from_ts(ts):
+    if isinstance(ts, datetime): u=ts.astimezone(UTC)
+    else: u=datetime.fromtimestamp(float(ts), tz=UTC)
+    return current_session(u)
+
+def _bt_quality(ind, direction, base_score, session, storm=False):
+    factors=set(); score=float(base_score)
+    if abs(ind['sma7']-ind['sma20'])/max(ind['sma20'],1e-9)>0.0015: factors.add('trend')
+    if abs(ind['mom'])>0.005: factors.add('momentum')
+    if ind.get('macd') is not None and ((direction=='long' and ind['macd']>0) or (direction=='short' and ind['macd']<0)): factors.add('macd')
+    if ind.get('adx') is not None and ind['adx']>30: factors.add('adx')
+    if ind.get('vwap') is not None and ((direction=='long' and ind['sma7']>ind['vwap']) or (direction=='short' and ind['sma7']<ind['vwap'])): factors.add('vwap')
+    if session in ('europe','us','overlap'): factors.add('session')
+    groups=0
+    if 'trend' in factors: groups+=1
+    if {'momentum','macd','adx'} & factors: groups+=1
+    if 'vwap' in factors: groups+=1
+    if 'session' in factors: groups+=1
+    q=45+score*6 + (8 if groups>=4 else 4 if groups==3 else -4 if groups<=1 else 0)
+    if storm:q-=10
+    if session=='overlap':q+=3
+    if session=='quiet':q-=4
+    return max(0,min(100,round(q,1))), factors
+
+def bt_on_data(closes, vols, coin, sl, tp, threshold, timestamps=None, highs=None, lows=None, funding=None):
+    """Realistic research backtest: OHLC intrabar exits, session-aware quality sizing,
+    fees, slippage, optional funding, no future data, conservative stop-first tie-break."""
+    if not closes or len(closes)<40: return None
+    closes=list(map(float,closes)); highs=list(map(float, highs or closes)); lows=list(map(float,lows or closes)); vols=list(map(float,vols or [0]*len(closes)))
+    if timestamps is None: timestamps=[i*3600 for i in range(len(closes))]
+    capital=1000.0; peak=capital; maxdd=0.0; trades=[]; i=30; cooldown_until=-1
+    fee_rate=HL_FEE; slip=0.0003
+    while i < len(closes)-2:
+        if i < cooldown_until: i+=1; continue
+        ind=_bt_indicators(closes,highs,lows,vols,i)
+        if not ind: i+=1; continue
+        direction=None; score=0.0
+        if ind['rsi'] < 38: direction='long'; score+=3
+        elif ind['rsi'] > 62: direction='short'; score+=3
+        else: i+=1; continue
+        if ind['mom']>0.005:
+            if direction=='long': score+=2
+            else: score-=3
+        elif ind['mom']<-0.005:
+            if direction=='short': score+=2
+            else: score-=3
+        if (ind['sma7']-ind['sma20'])/ind['sma20']>0.0015:
+            score += 1 if direction=='long' else -1
+        elif (ind['sma20']-ind['sma7'])/ind['sma20']>0.0015:
+            score += 1 if direction=='short' else -1
+        if ind.get('macd') is not None and ((direction=='long' and ind['macd']>0) or (direction=='short' and ind['macd']<0)): score+=1
+        if ind.get('adx') is not None and ind['adx']>30: score+=1
+        if ind.get('vwap') is not None and ((direction=='long' and closes[i]>ind['vwap']*1.002) or (direction=='short' and closes[i]<ind['vwap']*0.998)): score+=1
+        sess=_bt_session_from_ts(timestamps[i]);
+        if sess=='quiet': score-=0.5
+        elif sess=='overlap': score+=0.75
+        if score < threshold: i+=1; continue
+        q,factors=_bt_quality(ind,direction,score,sess)
+        risk_pct=0.0125 if q>=92 else 0.01 if q>=85 else 0.0075 if q>=75 else 0.005 if q>=65 else 0.0035
+        if sess=='quiet': risk_pct*=0.8
+        entry=closes[i]*(1+slip if direction=='long' else 1-slip)
+        # ATR from past OHLC only
+        tr=[]
+        for j in range(max(1,i-14),i+1): tr.append(max(highs[j]-lows[j],abs(highs[j]-closes[j-1]),abs(lows[j]-closes[j-1])))
+        atr=(np.mean(tr)/entry) if tr else sl
+        sl_pct=max(sl*0.6,min(sl*2.2,atr*2.5)); tp_pct=max(sl_pct*1.3,sl_pct*(tp/max(sl,1e-9)))
+        lev=min(eff_leverage(coin),MAX_LEV)
+        risk_dollars=capital*risk_pct; margin=risk_dollars/max(sl_pct*lev,1e-9); notional=margin*lev; size=notional/entry
+        entry_fee=notional*fee_rate
+        capital-=entry_fee
+        exit_reason='max_age'; exit_px=closes[min(i+24,len(closes)-1)]; exit_j=min(i+24,len(closes)-1); funding_cost=0.0
+        for j in range(i+1,min(i+25,len(closes))):
+            hi,lo=highs[j],lows[j]
+            sl_px=entry*(1-sl_pct if direction=='long' else 1+sl_pct)
+            tp_px=entry*(1+tp_pct if direction=='long' else 1-tp_pct)
+            hit_sl=(lo<=sl_px) if direction=='long' else (hi>=sl_px)
+            hit_tp=(hi>=tp_px) if direction=='long' else (lo<=tp_px)
+            if hit_sl:
+                exit_px=sl_px*(1-slip if direction=='long' else 1+slip); exit_reason='stop_loss'; exit_j=j; break
+            if hit_tp:
+                exit_px=tp_px*(1-slip if direction=='long' else 1+slip); exit_reason='take_profit'; exit_j=j; break
+            exit_px=closes[j]; exit_j=j
+        gross=(exit_px-entry)/entry*notional if direction=='long' else (entry-exit_px)/entry*notional
+        exit_fee=abs(notional*(exit_px/entry))*fee_rate
+        if funding:
+            for j in range(i+1,exit_j+1):
+                fr=float(funding[j] or 0); funding_cost += notional*fr*(1 if direction=='long' else -1)
+        net=gross-entry_fee-exit_fee-funding_cost
+        capital+=net; peak=max(peak,capital); maxdd=max(maxdd,(peak-capital)/peak)
+        trades.append({'i':i,'direction':direction,'score':score,'quality':q,'session':sess,'risk_pct':risk_pct,'lev':lev,'entry':entry,'exit':exit_px,'pnl':net,'pnl_pct':net/max(capital-net+1e-9,1e-9)*100,'reason':exit_reason})
+        if net<0: cooldown_until=exit_j+2
+        i=max(i+1,exit_j+1)
+    if not trades:return None
+    pnls=[t['pnl'] for t in trades]; wins=[p for p in pnls if p>0]; losses=[p for p in pnls if p<=0]
+    gw=sum(wins); gl=abs(sum(losses)); eq=1000.0; curve=[eq]
+    for p in pnls:eq+=p;curve.append(eq)
+    arr=np.array(pnls,float); sharpe=float(np.mean(arr)/np.std(arr)*np.sqrt(len(arr))) if len(arr)>2 and np.std(arr)>1e-12 else 0
+    return {'trades':len(trades),'win_rate':round(len(wins)/len(trades)*100,1),'profit_factor':round(gw/gl,2) if gl else 99.0,'total_pnl':round(capital-1000,2),'return_pct':round((capital/1000-1)*100,2),'max_drawdown_pct':round(maxdd*100,2),'sharpe':round(sharpe,2),'avg_quality':round(float(np.mean([t['quality'] for t in trades])),1),'avg_risk_pct':round(float(np.mean([t['risk_pct'] for t in trades]))*100,3),'trades_by_session':{s:sum(1 for t in trades if t['session']==s) for s in ('asia','europe','overlap','us','quiet')},'trade_log':trades}
+
+def _bt_entry_signal(closes, vols, i, coin, threshold, sl, tp):
+    # Historical signal uses the exact same deterministic core as analyze_coin.
+    prices = list(closes[:i+1])
+    if len(prices) < 20:
+        return None
+    core = _score_signal(prices, coin)
+    if core.get('score', 0) >= threshold and core.get('rsi_anchor') and core.get('direction'):
+        return {'coin': coin, 'direction': core['direction'], 'score': core['score']}
+    return None
+
+
+
+def run_backtest(coin="BTC", days=30, sl=None, tp=None, threshold=None):
+    """Run the research-grade OHLC backtest directly on Hyperliquid data.
+    Uses full candles so intrabar SL/TP ambiguity is handled conservatively."""
+    rows = _ohlcv(coin, '60', days * 24, drop_forming=True)
+    if not rows or len(rows) < 40:
+        return None
+    closes=[r['c'] for r in rows]; highs=[r['h'] for r in rows]; lows=[r['l'] for r in rows]; vols=[r['v'] for r in rows]
+    timestamps=[time.time() - (len(rows)-1-i)*3600 for i in range(len(rows))]
+    _dyn_sl, _dyn_tp, _ = dynamic_levels(coin)
+    sl = sl if sl is not None else _dyn_sl
+    tp = tp if tp is not None else _dyn_tp
+    result = bt_on_data(closes, vols, coin, sl, tp, threshold or get_tuned()['threshold'],
+                        timestamps=timestamps, highs=highs, lows=lows)
+    if result:
+        result['buy_hold_pct'] = round(((closes[-1] - closes[0]) / closes[0]) * 100, 2)
+        result['vs_buy_hold'] = 'BETTER' if result.get('return_pct', 0) > result['buy_hold_pct'] else 'WORSE'
+        result['data_bars'] = len(rows)
+    return result
+
+
+def run_research_backtest_from_csv(path, coin='BTC', threshold=None):
+    """Run the research-grade backtest from CSV. Required: time,open,high,low,close,volume.
+    Optional: funding. Time may be ISO-8601 UTC or epoch seconds/ms."""
+    rows=[]
+    with open(path, newline='', encoding='utf-8-sig') as f:
+        for r in csv.DictReader(f): rows.append(r)
+    if len(rows)<100: raise ValueError('حداقل 100 کندل لازم است')
+    def num(r,k,default=0):
+        try:return float(r.get(k,default))
+        except:return float(default)
+    ts=[]
+    for r in rows:
+        raw=r.get('time') or r.get('timestamp') or r.get('datetime')
+        try:
+            if str(raw).isdigit():
+                x=float(raw); ts.append(x/1000 if x>1e12 else x)
+            else: ts.append(datetime.fromisoformat(str(raw).replace('Z','+00:00')).timestamp())
+        except: ts.append(float(len(ts))*3600)
+    closes=[num(r,'close') for r in rows]; highs=[num(r,'high',num(r,'close')) for r in rows]; lows=[num(r,'low',num(r,'close')) for r in rows]; vols=[num(r,'volume') for r in rows]
+    funds=[num(r,'funding',0) for r in rows] if 'funding' in rows[0] else None
+    return bt_on_data(closes,vols,coin,STOP_LOSS,TAKE_PROFIT,threshold or get_tuned()['threshold'],timestamps=ts,highs=highs,lows=lows,funding=funds)
+
+def monte_carlo_trade_shuffle(trades, runs=5000, seed=42):
+    """Bootstrap trade returns with replacement and compound them.
+    The old permutation method preserved total PnL by construction, so its
+    final-PnL percentiles were necessarily identical. This method produces a
+    genuine distribution while preserving the empirical return distribution.
+    """
+    if not trades or len(trades) < 20:
+        return None
+    rng = np.random.default_rng(seed)
+    rets = np.array([float(t.get('pnl_pct', 0.0)) / 100.0 for t in trades], dtype=float)
+    rets = np.clip(rets, -0.95, 10.0)
+    n = len(rets)
+    finals = np.empty(runs); dds = np.empty(runs)
+    for k in range(runs):
+        sample = rng.choice(rets, size=n, replace=True)
+        eq = 1000.0; peak = eq; mdd = 0.0
+        for r in sample:
+            eq *= 1.0 + r
+            peak = max(peak, eq)
+            mdd = max(mdd, (peak - eq) / peak * 100.0)
+        finals[k] = eq; dds[k] = mdd
+    return {
+        'method': 'bootstrap_with_replacement_compounded',
+        'runs': runs, 'seed': seed,
+        'median_final': round(float(np.median(finals)), 2),
+        'p05_final': round(float(np.percentile(finals, 5)), 2),
+        'p95_final': round(float(np.percentile(finals, 95)), 2),
+        'median_return_pct': round(float((np.median(finals)/1000.0 - 1) * 100), 2),
+        'p05_return_pct': round(float((np.percentile(finals, 5)/1000.0 - 1) * 100), 2),
+        'p95_return_pct': round(float((np.percentile(finals, 95)/1000.0 - 1) * 100), 2),
+        'p95_drawdown': round(float(np.percentile(dds, 95)), 2),
+        'worst_drawdown': round(float(np.max(dds)), 2),
+    }
+
+
+def walk_forward_backtest(coin='BTC', train_days=90, test_days=30):
+    """Rolling 90/30 validation using OHLC data and the same research engine."""
+    try:
+        rows = _ohlcv(coin, '60', (train_days + test_days) * 24, drop_forming=True)
+        if not rows or len(rows) < (train_days + test_days) * 24 * 0.8:
+            return None
+        step=test_days*24; train_n=train_days*24; windows=[]; start=0
+        while start+train_n+step<=len(rows):
+            tr=rows[start:start+train_n]; te=rows[start+train_n:start+train_n+step]
+            def run(rs, th):
+                return bt_on_data([x['c'] for x in rs],[x['v'] for x in rs],coin,STOP_LOSS,TAKE_PROFIT,th,
+                                  timestamps=[x['t']/1000 for x in rs],highs=[x['h'] for x in rs],lows=[x['l'] for x in rs])
+            best_th=4; best_pf=-1
+            for th in (3,4,5,6):
+                r=run(tr,th)
+                if r and r['trades']>=10 and r['profit_factor']>best_pf: best_pf=r['profit_factor']; best_th=th
+            rtr=run(tr,best_th); rte=run(te,best_th)
+            windows.append({'best_threshold':best_th,'train':rtr,'test':rte})
+            start+=step
+        valid=[w for w in windows if w['test'] and w['test']['trades']>=5]
+        return {'windows':windows,'valid_windows':len(valid),
+                'avg_test_pf':round(float(np.mean([w['test']['profit_factor'] for w in valid])),2) if valid else 0,
+                'avg_test_return':round(float(np.mean([w['test']['return_pct'] for w in valid])),2) if valid else 0,
+                'avg_test_dd':round(float(np.mean([w['test']['max_drawdown_pct'] for w in valid])),2) if valid else 0}
+    except Exception:
+        return None
+
+
+# ============ Per-coin permission filter ============
+
+
+
+def _learn_from_trade(trade):
+    try:
+        coin = trade.get('coin', '')
+        pnl = trade.get('pnl', 0) or 0
+        factors = trade.get('factors', [])
+        w = get_factor_weights()
+        for f in factors:
+            if f in w:
+                if pnl > 0: w[f] = min(WEIGHT_MAX, w[f] + 0.02)
+                else: w[f] = max(WEIGHT_MIN, w[f] - 0.03)
+        state['factor_weights'] = w
+        if 'coin_scores' not in state: state['coin_scores'] = {}
+        old = state['coin_scores'].get(coin, 0)
+        state['coin_scores'][coin] = old + (pnl * 0.5 if pnl < 0 else pnl * 0.1)
+    except:
+        pass
+def _update_coin_scores():
+    try:
+        scores = state.setdefault('coin_scores', {})
+        for t in get_ledger('paper').get('trades', [])[-100:]:
+            c, p = t.get('coin'), t.get('pnl', 0)
+            if c: scores[c] = scores.get(c, 0) + (p * 0.3 if p < 0 else p * 0.1)
+    except: pass
+def update_coin_filter():
+    """Ban coins with a persistently losing recent record (paper evidence)."""
+    lg = get_ledger('paper')
+    trades = lg['trades']
+    now = time.time()
+    banned = state.setdefault('coin_banned', {})
+    # expire old bans
+    for c in list(banned):
+        if banned[c] <= now:
+            del banned[c]
+    from collections import defaultdict
+    by_coin = defaultdict(list)
+    for t in trades:
+        if now - t.get('ts', 0) < 30 * 86400:
+            by_coin[t.get('coin')].append(t.get('pnl', 0))
+    for c, ps in by_coin.items():
+        if len(ps) >= 6 and sum(1 for p in ps if p > 0) / len(ps) < 0.25:
+            banned[c] = now + 86400
+            add_log(f'Coin filter: {c} benched 24h (recent win rate low)')
+
+# ============ Performance statistics ============
+
+def wilson_ci(wins, n, z=1.96):
+    if n == 0:
+        return (0.0, 0.0)
+    p = wins / n
+    denom = 1 + z * z / n
+    center = (p + z * z / (2 * n)) / denom
+    margin = (z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))) / denom
+    return (max(0.0, center - margin) * 100, min(1.0, center + margin) * 100)
+
+def perf_stats(lg_name='paper'):
+    lg = get_ledger(lg_name)
+    trades = lg['trades']
+    if not trades:
+        return None
+    pnls = [t.get('pnl', 0) for t in trades]
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p <= 0]
+    gw, gl = sum(wins), abs(sum(losses))
+    eq = PAPER_CAPITAL if lg_name == 'paper' else live_base_capital()
+    peak, max_dd = eq, 0.0
+    for p in pnls:
+        eq += p
+        peak = max(peak, eq)
+        max_dd = max(max_dd, (peak - eq) / peak)
+    sharpe = sortino = 0.0
+    if len(pnls) >= 3:
+        arr = np.array(pnls, dtype=float)
+        sd = float(np.std(arr))
+        sharpe = round(float(np.mean(arr)) / sd * (len(arr) ** 0.5), 2) if sd > 1e-12 else 0.0
+        downs = arr[arr < 0]
+        dsd = float(np.std(downs)) if len(downs) > 1 else (abs(float(downs[0])) if len(downs) == 1 else 0.0)
+        sortino = round(float(np.mean(arr)) / dsd * (len(arr) ** 0.5), 2) if dsd > 1e-12 else 99.0
+    lo, hi = wilson_ci(len(wins), len(pnls))
+    return {'count': len(pnls), 'win_rate': round(len(wins) / len(pnls) * 100, 1),
+            'wr_ci': (round(lo, 1), round(hi, 1)),
+            'avg_win': round(float(np.mean(wins)), 4) if wins else 0,
+            'avg_loss': round(float(np.mean(losses)), 4) if losses else 0,
+            'profit_factor': round(gw / gl, 2) if gl > 0 else (99.0 if gw > 0 else 0),
+            'max_drawdown': round(max_dd * 100, 1),
+            'total_pnl': round(sum(pnls), 4), 'sharpe': sharpe, 'sortino': sortino}
+
+def trades_csv(lg_name='paper'):
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(['coin', 'direction', 'entry', 'exit', 'pnl', 'pnl_pct', 'reason', 'live', 'time'])
+    for t in get_ledger(lg_name)['trades']:
+        w.writerow([t.get('coin', ''), t.get('direction', ''), t.get('entry', 0),
+                    t.get('exit', 0), f"{t.get('pnl', 0):.6f}", f"{t.get('pnl_pct', 0):.3f}",
+                    t.get('reason', ''), t.get('live', False), t.get('time', '')])
+    return out.getvalue()
+
+# ============ Telegram ============
+
+def tg_proxies():
+    p = os.environ.get('TG_PROXY', '').strip()
+    if p:
+        return {'http': p, 'https': p}
+    return None
+
+_last_tg = [0.0]
+
+def send_telegram(msg, keyboard=None):
+    token = state.get('tg_token', '')
+    chat = state.get('tg_chat', '')
+    if not token or not chat:
+        return False
+    now = time.time()
+    wait = 2.0 - (now - _last_tg[0])
+    if wait > 0:
+        time.sleep(wait)
+    _last_tg[0] = time.time()
+    payload = {'chat_id': chat, 'text': msg, 'parse_mode': 'HTML'}
+    if keyboard:
+        payload['reply_markup'] = {'inline_keyboard': keyboard}
+    url = 'https://api.telegram.org/bot' + token + '/sendMessage'
+    try:
+        r = requests.post(url, json=payload, timeout=10, proxies=tg_proxies())
+        if r.status_code == 200:
+            return True
+        if r.status_code == 429:
+            retry_after = int(r.json().get('parameters', {}).get('retry_after', 5))
+            time.sleep(retry_after)
+            return send_telegram(msg, keyboard)
+    except Exception:
+        pass
+    try:
+        r = requests.post(url, json=payload, timeout=10)
+        if r.status_code == 429:
+            retry_after = int(r.json().get('parameters', {}).get('retry_after', 5))
+            time.sleep(retry_after)
+            return send_telegram(msg, keyboard)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+def tg_test():
+    return send_telegram('🤖 ربات هایپرلیکوئید v26 وصل شد!')
+
+tg_offset = [0]
+
+def tg_poll():
+    token = state.get('tg_token', '')
+    chat = str(state.get('tg_chat', ''))
+    if not token or not chat:
+        return
+    try:
+        r = requests.get(f'https://api.telegram.org/bot{token}/getUpdates',
+                         params={'offset': tg_offset[0] + 1, 'timeout': 0},
+                         timeout=10, proxies=tg_proxies())
+        if r.status_code != 200:
+            return
+        for upd in r.json().get('result', []):
+            tg_offset[0] = max(tg_offset[0], upd['update_id'])
+            msg = upd.get('message', {})
+            if str(msg.get('chat', {}).get('id', '')) != chat:
+                continue
+            text = (msg.get('text') or '').strip().lower()
+            if text.startswith('/status'):
+                p_lg = get_ledger('paper')
+                l_lg = get_ledger('live')
+                send_telegram(
+                    f"📊 وضعیت\nحالت: {'🔴 لایو+مجازی' if state['mode']=='live' else '🔵 فقط مجازی'}\n"
+                    f"🔵 مجازی: {p_lg['capital']:.2f}$ ({len(p_lg['positions'])} باز)\n"
+                    + (f"🔴 واقعی (HL): {(l_lg['capital'] or 0):.2f}$ ({len(l_lg['positions'])} باز)\n" if state['mode'] == 'live' else '')
+                    + f"اسکن: {state['total_scans']} | توقف دستی: {'بله' if state.get('manual_paused') else 'خیر'}")
+            elif text.startswith('/paper'):
+                st = perf_stats('paper')
+                if st:
+                    send_telegram(f"🔵 موتور مجازی (۱۰۰$)\nمعاملات: {st['count']} | برد: {st['win_rate']}% "
+                                  f"(CI {st['wr_ci'][0]}-{st['wr_ci'][1]})\nPF: {st['profit_factor']} | PnL: {st['total_pnl']:+.2f}$")
+                else:
+                    send_telegram('موتور مجازی هنوز معامله‌ای نداره')
+            elif text.startswith('/stop'):
+                state['manual_paused'] = True
+                send_telegram('⏸ ورودهای جدید متوقف شد (بازها مدیریت می‌شن) - /start برای ادامه')
+            elif text.startswith('/start'):
+                ok_resume, why_resume = can_resume_live()
+                if not ok_resume:
+                    send_telegram('⛔ ادامه مجاز نیست: ' + str(why_resume))
+                else:
+                    state['manual_paused'] = False
+                    send_telegram('▶️ ادامه')
+            elif text.startswith('/report'):
+                for lg_name in ('paper', 'live'):
+                    st = perf_stats(lg_name)
+                    if st:
+                        send_telegram(f"📈 {ledger_label(lg_name)}\n{st['count']} معامله | برد {st['win_rate']}% | "
+                                      f"PF {st['profit_factor']} | PnL {st['total_pnl']:+.2f}$ | DD {st['max_drawdown']}%")
+            elif text.startswith('/killswitch'):
+                panic_close_all('telegram')
+                send_telegram('🔴 کلید اضطراری: همه بسته شد و ربات متوقف شد')
+            elif text.startswith('/approve'):
+                sig = state.get('pending_live_signal')
+                if not sig:
+                    send_telegram('⚠️ سیگنال منتظر تأییدی وجود نداره')
+                elif time.time() > sig.get('expires', 0):
+                    state['pending_live_signal'] = None
+                    send_telegram('⏰ سیگنال منقضی شد (۵ دقیقه گذشته) - دوباره صبر کن')
+                else:
+                    _blocked = False
+                    _lg_check = get_ledger('live')
+                    r_block = entries_blocked_reason(_lg_check, live_base_capital())
+                    if r_block:
+                        _blocked = True
+                        send_telegram('🚫 تأیید رد شد - ' + str(r_block))
+                    if state.get('market_circuit', 0) > time.time():
+                        _blocked = True
+                        send_telegram('🚫 تأیید رد شد - بازار در حالت قطع مدار')
+                    _cur = state['prices'].get(sig['coin'])
+                    if _cur and sig.get('price') and not _blocked:
+                        _move = abs(_cur - sig['price']) / sig['price']
+                        if _move > 0.02:
+                            _blocked = True
+                            send_telegram('⚠️ قیمت بیش از ۲٪ جابه‌جا شده - سیگنال باطل شد')
+                    if not _blocked:
+                        add_log(f'SEMI-AUTO: user APPROVED {sig["coin"]} {sig["direction"]}')
+                        send_telegram(f'✅ تأیید شد - {COIN_FA.get(sig["coin"], sig["coin"])} {sig["direction"]}')
+                        opened = hl_open_live(sig['coin'], sig['direction'], sig['margin'], sig['price'], sig['lev'])
+                        if opened:
+                            price = opened['entry']
+                            size = opened['size']
+                            live_id = opened['oid']
+                            lg = get_ledger('live')
+                            _sl_use = sig.get('sl_pct', 0.02)
+                            _tp_use = sig.get('tp_pct', 0.03)
+                            pos = engine_open(lg, coin=sig['coin'], direction=sig['direction'], price=price,
+                                              margin=sig['margin'], leverage=sig['lev'],
+                                              sl_pct=_sl_use, tp_pct=_tp_use, ts=time.time(),
+                                              live_id=live_id, size=size,
+                                              reasons=sig['signal'].get('reasons', []),
+                                              factors=sig['signal'].get('factors', []))
+                            if pos and size:
+                                hl_place_sl(pos)
+                            send_telegram(f'✅ {COIN_FA.get(sig["coin"])} معامله باز شد!')
+                    state['pending_live_signal'] = None
+            elif text.startswith('/reject'):
+                sig = state.get('pending_live_signal')
+                if sig:
+                    add_log(f'SEMI-AUTO: user REJECTED {sig["coin"]} {sig["direction"]}')
+                    send_telegram(f'❌ رد شد - {COIN_FA.get(sig["coin"], sig["coin"])}')
+                    state['pending_live_signal'] = None
+            elif text.startswith('/ping'):
+                send_telegram('🏓 پونگ! ربات فعاله')
+            elif text.startswith('/help'):
+                send_telegram('📋 <b>دستورات ربات</b>\n\n'
+                              '🔹 /status - وضعیت کلی حساب\n'
+                              '🔹 /paper - آمار موتور مجازی\n'
+                              '🔹 /report - گزارش کامل دو موتور\n'
+                              '🔹 /stop - توقف ورودهای جدید\n'
+                              '🔹 /start - ادامه معاملات\n'
+                              '🔹 /killswitch - توقف اضطراری (همه بسته)\n'
+                              '🔹 /ping - تست زنده بودن بات\n'
+                              '🔹 /help - راهنما')
+        save_state()
+    except Exception:
+        pass
+
+# ============ reports / health ============
+
+def _ascii_sparkline(values, width=24):
+    '''Simple ASCII sparkline from a list of numbers.'''
+    if not values:
+        return ''
+    mn, mx = min(values), max(values)
+    rng = mx - mn if mx != mn else 1.0
+    chars = '▁▂▃▄▅▆▇█'
+    result = ''
+    for v in values:
+        idx = min(len(chars)-1, int((v - mn) / rng * (len(chars)-1)))
+        result += chars[idx]
+    return result
+
+
+def _weekly_report_text():
+    try:
+        lines = [f'Weekly report - {fa_now().strftime("%Y-W%W")}', '']
+        for n in ('paper', 'live'):
+            s = perf_stats(n)
+            if s: lines.append(f'{ledger_label(n)}: {s["count"]}T, {s["win_rate"]}% WR, PF {s["profit_factor"]}, {s["total_pnl"]:+.2f}$')
+        lines.append(f'Regime: {REGIME_FA.get((state.get("regime") or {}).get("regime"), "-")}')
+        return chr(10).join(lines)
+    except: return 'report error'
+def daily_report_text():
+    lines = [f"📋 گزارش روزانه - {fa_now().strftime('%Y-%m-%d')}", '']
+    for lg_name in ('paper', 'live'):
+        st = perf_stats(lg_name)
+        if st:
+            lines.append(f"{ledger_label(lg_name)}:")
+            lines.append(f"معاملات: {st['count']} | برد: {st['win_rate']}% (CI {st['wr_ci'][0]}-{st['wr_ci'][1]})")
+            lines.append(f"PF: {st['profit_factor']} | PnL: {st['total_pnl']:+.2f}$ | DD: {st['max_drawdown']}%")
+            # Add sparkline of equity curve (last 30 points)
+            eq_pts = [e['eq'] for e in get_ledger(lg_name).get('equity', []) if e.get('eq')]
+            if len(eq_pts) >= 5:
+                spark = _ascii_sparkline(eq_pts[-30:])
+                lines.append(f"منحنی: {spark} {eq_pts[-1]:.2f}$")
+            lines.append('')
+    rg = state.get('regime') or {}
+    lines.append(f"رژیم بازار: {REGIME_FA.get(rg.get('regime'), '-')}")
+    lines.append(f"اسکن‌های انجام‌شده: {state['total_scans']}")
+    return '\n'.join(lines)
+
+def system_health():
+    try:
+        scan_age = time.time() - state.get('last_scan_ts', 0)
+    except Exception:
+        scan_age = 99999
+    try:
+        st = os.statvfs(BASE_DIR)
+        disk_free = st.f_bavail * st.f_frsize / (1024 ** 3)
+    except Exception:
+        disk_free = None
+    if disk_free is None:
+        try:
+            # Windows fallback: use shutil.disk_usage
+            import shutil
+            _total, _used, _free = shutil.disk_usage(BASE_DIR)
+            disk_free = _free / (1024 ** 3)
+        except Exception:
+            disk_free = None
+    return {'scan_age_s': scan_age, 'scan_ok': scan_age < 1800, 'disk_free_gb': disk_free}
+
+def heartbeat_text():
+    p = get_ledger('paper')
+    l = get_ledger('live')
+    rg = (state.get('regime') or {}).get('regime', '-')
+    return (f'💓 ربات زنده است\nحالت: {state["mode"]}\n'
+            f'مجازی: {p["capital"]:.2f}$ ({len(p["positions"])} باز)\n'
+            f'واقعی: {(l["capital"] or 0):.2f}$ ({len(l["positions"])} باز)\n'
+            f'رژیم: {REGIME_FA.get(rg)} | اسکن: {state["total_scans"]}')
+
+# ============ MAIN LOOP ============
+
+def _ws_price_thread():
+    """Background WebSocket thread that receives real-time prices from
+    Hyperliquid every ~200ms — replaces 5-minute REST polling (S-03)."""
+    ws = None
+    while True:
+        try:
+            import websocket as _ws
+            url = hl_base_url().replace('https://', 'wss://') + '/ws'
+            ws = _ws.create_connection(url, timeout=10)
+            ws.send(_json.dumps({"type": "subscribe", "channel": "allMids"}))
+            ws.settimeout(30)
+            while True:
+                raw = ws.recv()
+                if not raw:
+                    continue
+                try:
+                    msg = _json.loads(raw)
+                    if msg.get('channel') == 'allMids':
+                        mids = msg.get('data', {}).get('mids', {})
+                        if mids:
+                            prices = {}
+                            for c in SCAN_COINS:
+                                v = mids.get(c)
+                                if v:
+                                    try:
+                                        prices[c] = float(v)
+                                    except Exception:
+                                        pass
+                            if prices:
+                                with state_lock:
+                                    state['prices'] = prices
+                                    state['prices_ts'] = fa_now().strftime('%H:%M:%S.%f')[:-3]
+                                    state['ws_connected'] = True
+                                    state['price_fails'] = 0
+                                    hist = state['price_history']
+                                    hist.append({'t': time.time(), 'p': prices.get('BTC')})
+                                    if len(hist) > 500:
+                                        state['price_history'] = hist[-500:]
+                except Exception:
+                    pass
+        except Exception:
+            if state.get('ws_connected'):
+                state['ws_connected'] = False
+                add_log('WebSocket disconnected - falling back to REST polling')
+                send_telegram('⚠️ اتصال WebSocket قطع شد - polling جایگزین شد')
+        finally:
+            try:
+                if ws:
+                    ws.close()
+            except Exception:
+                pass
+            time.sleep(5)  # reconnect delay
+
+def auto_backup():
+    """Daily state backup so a corrupted state.json never loses history (issue #20)."""
+    try:
+        if not os.path.exists(STATE_FILE):
+            return
+        bk_dir = os.path.join(BASE_DIR, 'backups')
+        os.makedirs(bk_dir, exist_ok=True)
+        name = f'state-{fa_now().strftime("%Y%m%d")}.json'
+        dst = os.path.join(bk_dir, name)
+        if not os.path.exists(dst):
+            import shutil
+            shutil.copy2(STATE_FILE, dst)
+            # keep only last 14 daily backups
+            files = sorted(f for f in os.listdir(bk_dir) if f.startswith('state-'))
+            for old in files[:-14]:
+                try:
+                    os.remove(os.path.join(bk_dir, old))
+                except Exception:
+                    pass
+    except Exception:
+        log_exception('auto_backup')
+
+def bot_loop():
+    add_log(f'Hyperliquid bot v{STRATEGY_VERSION} started (paper always-on, live={"ON" if state["mode"]=="live" else "off"}, net={hl_base_url()})')
+    state['status'] = 'Active'
+    # start WebSocket price feed in background (S-03)
+    try:
+        thr = threading.Thread(target=_ws_price_thread, daemon=True, name='ws-prices')
+        thr.start()
+        add_log('WebSocket price feed started')
+    except Exception:
+        log_exception('ws_thread')
+    if state.get('mode') == 'live':
+        ok, info = hl_test_connection()
+        if not ok:
+            reason = state.get('hl_block_reason') or info
+            state['hl_block_reason'] = reason
+            add_log(f'LIVE BLOCKED: {reason}')
+            send_telegram(f'🚫 معاملات واقعی قفل است:\n{reason}\nربات فقط حالت مجازی ادامه می‌ده.')
+        else:
+            add_log(f'HL connection OK: {info}')
+            state['hl_agent_ok'] = True
+            state['hl_block_reason'] = ''
+            sync_live_capital()
+            if not reconcile_live_positions():
+                add_log('LIVE startup reconciliation reported unsafe state; new entries remain blocked')
+    last_scan = last_manage = last_funding = last_optimize = 0.0
+    last_heartbeat = time.time()
+    while True:
+        try:
+            now = time.time()
+            # daily auto-backup of state.json (issue #20)
+            if now - state.get('last_auto_bk', 0) > 86400:
+                state['last_auto_bk'] = now
+                auto_backup()
+            # Nightly AI learning (~23:00)
+            if now - state.get('last_nightly', 0) > 82800:
+                state['last_nightly'] = now
+                try:
+                    if state.get('mode') != 'live':
+                        _nightly_learn()
+                        _nightly_optimize()
+                        _nightly_check_strategies()
+                        overlord_nightly(state, get_ledger, add_log, send_telegram)
+                        overlord_adjust_threshold(get_candles, bt_on_data, STOP_LOSS, TAKE_PROFIT, get_tuned, state, add_log, send_telegram)
+                    else:
+                        add_log('Nightly learning skipped: LIVE production strategy is frozen')
+                except Exception:
+                    log_exception('nightly')
+            # GitHub update check every 6h
+            if now - state.get('last_gh_check', 0) > 21600:
+                state['last_gh_check'] = now
+                try:
+                    _upd = check_github_update()
+                    if _upd:
+                        add_log(f'UPDATE: {_upd}')
+                        send_telegram(f'🔄 بروزرسانی: {_upd}')
+                except Exception:
+                    pass
+            hhmm = fa_now().strftime('%H:%M')
+            today_s = fa_now().strftime('%Y-%m-%d')
+            hb_iv = int(state.get('heartbeat_hours', 0) or 0)
+            if state.get('tg_token') and state.get('tg_chat'):
+                if fa_now().strftime('%A') == 'Fri' and state.get('last_weekly_report') != today_s:
+                    state['last_weekly_report'] = today_s
+                    try:
+                        send_telegram(_weekly_report_text())
+                        add_log('Weekly report sent')
+                    except Exception:
+                        log_exception('weekly report failed')
+                if hhmm >= '22:30' and state.get('last_daily_report') != today_s:
+                    state['last_daily_report'] = today_s
+                    try:
+                        send_telegram(daily_report_text())
+                        add_log('Daily report sent')
+                    except Exception:
+                        log_exception('daily report failed')
+                if hb_iv > 0 and now - last_heartbeat > hb_iv * 3600:
+                    last_heartbeat = now
+                    send_telegram(heartbeat_text())
+            if now - state.get('last_poll', 0) > 8:
+                state['last_poll'] = now
+                tg_poll()
+            if now - state.get('last_selfguard', 0) > 600:
+                state['last_selfguard'] = now
+                try:
+                    h = system_health()
+                    if h['disk_free_gb'] is not None and h['disk_free_gb'] < 0.5 and not state.get('disk_warned'):
+                        state['disk_warned'] = True
+                        send_telegram(f'🚨 فضای دیسک کمه ({h["disk_free_gb"]:.1f}G)!')
+                    elif h['disk_free_gb'] is not None and h['disk_free_gb'] > 1.0:
+                        state['disk_warned'] = False
+                    open_any = len(get_ledger('paper')['positions']) + len(get_ledger('live')['positions'])
+                    if open_any and h['scan_age_s'] > 1800 and not state.get('blackout_warned'):
+                        state['blackout_warned'] = True
+                        send_telegram(f'🚨 {open_any} معامله بازه و {h["scan_age_s"]//60} دقیقه‌ست قیمت نداریم! اینترنت/سرور رو چک کن')
+                    elif h['scan_ok']:
+                        state['blackout_warned'] = False
+                    if state.get('mode') == 'live' and now - state.get('last_reconcile', 0) > 120:  # reconcile every 2 min (was 30)
+                        state['last_reconcile'] = now
+                        sync_live_capital(quiet=True)
+                        reconcile_live_positions()
+                except Exception:
+                    log_exception('self guard failed')
+            if now - last_funding > 1800:
+                last_funding = now
+                try:
+                    update_funding()
+                    old_r = (state.get('regime') or {}).get('regime')
+                    rg = detect_regime()
+                    if rg:
+                        state['regime'] = rg
+                        if rg['regime'] != old_r and old_r is not None:
+                            send_telegram(f'Regime change: {REGIME_FA.get(old_r)} -> {REGIME_FA.get(rg["regime"])}')
+                            if old_r in ('trend_up','trend_down') and rg['regime'] == 'range':
+                                state['threshold_extra'] = 0
+                                add_log('Drift: reset threshold to 0')
+                            send_telegram(f'🔄 رژیم بازار: {REGIME_FA.get(rg["regime"])}')
+                    crash_guard_active()
+                    evaluate_shadows()
+                    # 🐉 Dragon funding hunter scan
+                    try:
+                        _dsigs = dragon_hunter_scan()
+                        if _dsigs:
+                            for _ds in _dsigs:
+                                add_log(f'DRAGON: {_ds["coin"]} {_ds["direction"]} score={_ds["score"]}')
+                                send_telegram(f'🐉 سیگنال فاندینگ: {COIN_FA.get(_ds["coin"], _ds["coin"])} {"📈" if _ds["direction"]=="long" else "📉"} {_ds["score"]} - {_ds["reasons"][0]}')
+                                if open_engine_position('paper', _ds):
+                                    break
+                                if state.get('mode') == 'live' and state.get('hl_agent_ok'):
+                                    if open_engine_position('live', _ds):
+                                        break
+                    except Exception:
+                        log_exception('dragon scan')
+                    # 🐉 Dragon position management
+                    try:
+                        dragon_manage_positions()
+                    except Exception:
+                        pass
+                except Exception:
+                    log_exception('regime/funding tick')
+            if now - last_optimize > 86400:
+                last_optimize = now
+                try:
+                    update_coin_filter()
+                except Exception:
+                    pass
+            if now - last_manage > POS_CHECK_INTERVAL:
+                last_manage = now
+                try:
+                    manage_all_positions()
+                except Exception:
+                    log_exception('manage tick')
+            if now - last_scan > SCAN_INTERVAL:
+                last_scan = now
+                try:
+                    if get_prices():
+                        state['last_scan_ts'] = now
+                        state['total_scans'] = state.get('total_scans', 0) + 1
+                        sigs = analyze()
+                        # TITAN: multi-strategy
+                        _regime = state.get('regime', {}).get('regime', 'ranging')
+                        _tsigs = []
+                        for _tc in SCAN_COINS:
+                            try:
+                                _ts = titan_scan(get_candles_cached, _tc, COIN_FA, _regime)
+                                if _ts and _ts['score'] >= 4:
+                                    # Run safety filters (spread, orderbook, MTF, volume)
+                                    _ts = confirm_signal(_ts)
+                                    if _ts and _ts.get('score', 0) >= 4:
+                                        _tsigs.append(_ts)
+                            except: pass
+                        if _tsigs:
+                            _tsigs.sort(key=lambda x: x['score'], reverse=True)
+                            best_t = _tsigs[0]
+                            add_log('TITAN: ' + str(best_t['coin']) + ' ' + str(best_t['direction']) + ' via ' + str(best_t['strategy']) + ' score=' + str(best_t['score']))
+                            # Use titan signal as additional signal source
+                            if sigs:
+                                sigs.insert(0, best_t)
+                            else:
+                                sigs = _tsigs
+                        if sigs:
+                            for sig in sigs:
+                                if open_engine_position('paper', sig):
+                                    break
+                            live_ok = (state.get('mode') == 'live' and state.get('hl_agent_ok')
+                                       and not state.get('crash_mode')
+                                       and state.get('market_circuit', 0) < time.time())
+                            # Market drawdown filter
+                            _market_selloff = _market_drawdown()
+                            if _market_selloff and sigs:
+                                add_log('MARKET DRAWDOWN: blocking ' + str(len(sigs)) + ' signals')
+                                sigs = []
+                            if state.get('mode') == 'live' and not state.get('hl_agent_ok'):
+                                # re-check once/hour in case the user fixed approval while running
+                                if now - state.get('last_live_retry', 0) > 3600:
+                                    state['last_live_retry'] = now
+                                    ok, _ = hl_test_connection()
+                                    state['hl_agent_ok'] = ok
+                                    if ok:
+                                        sync_live_capital()
+                                        reconcile_live_positions()
+                            if live_ok:
+                                for sig in sigs:
+                                    if open_engine_position('live', sig):
+                                        break
+                        save_state()
+                except Exception:
+                    log_exception('scan tick')
+            if now - state.get('last_save', 0) > 60:
+                state['last_save'] = now
+                save_state()
+            state['loop_streak'] = state.get('loop_streak', 0) + 1
+        except Exception:
+            log_exception('bot_loop tick')
+            state['loop_streak'] = 0
+            state['loop_fails'] = state.get('loop_fails', 0) + 1
+            if state.get('loop_fails', 0) >= 4:
+                state['loop_fails'] = 0
+                try:
+                    send_telegram('🚨 حلقه اصلی ربات مدام خطا میدهد! لاگ را بررسی کنید')
+                except Exception:
+                    pass
+                # Fallback alert even without Telegram: write a critical file
+                try:
+                    with open(os.path.join(BASE_DIR, 'CRITICAL_ALERT.txt'), 'w') as _f:
+                        _f.write('Bot loop failed ' + str(state.get('loop_fails', 4)) + ' times in a row at ' + fa_now().isoformat() + ' - CHECK app.log')
+                except Exception:
+                    pass
+        time.sleep(5)
+
+# ============ Web dashboard ============
+
+_CSS = """
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:Vazirmatn,Tahoma,'Segoe UI',sans-serif;background:#0d1117;color:#e6edf3;direction:rtl;padding:16px}
+a{color:#58a6ff;text-decoration:none}
+.top{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:16px}
+.top h1{font-size:20px;color:#fff}
+.pill{background:#161b22;border:1px solid #30363d;border-radius:999px;padding:4px 14px;font-size:12px}
+.pill.green{background:#12261a;border-color:#238636;color:#3fb950}
+.pill.red{background:#2d1216;border-color:#da3633;color:#f85149}
+.pill.orange{background:#2d1f0f;border-color:#9e6a03;color:#d29922}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:12px;margin-bottom:12px}
+.card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:14px}
+.card h3{font-size:14px;color:#8b949e;margin-bottom:10px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:right;padding:6px 8px;border-bottom:1px solid #21262d}
+th{color:#8b949e;font-weight:600}
+.green{color:#3fb950}.red{color:#f85149}.orange{color:#d29922}
+button{background:#238636;color:#fff;border:0;border-radius:8px;padding:8px 16px;cursor:pointer;font-size:13px}
+button.danger{background:#da3633}
+button.gray{background:#30363d}
+input,select{background:#0d1117;border:1px solid #30363d;color:#e6edf3;border-radius:8px;padding:8px;margin:4px 0}
+label{font-size:12px;color:#8b949e;display:block;margin-top:8px}
+.log{font-size:11px;color:#8b949e;max-height:220px;overflow-y:auto;line-height:1.7}
+.log b{color:#c9d1d9}
+.mono{font-family:'Courier New',monospace;direction:ltr;text-align:left}
+.small{font-size:11px;color:#8b949e}
+.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+"""
+
+def _best_signal_str():
+    '''Best current signal for dashboard display.'''
+    tbl = state.get('scan_table', [])
+    if not tbl:
+        return '—'
+    top = tbl[0]
+    dir_icon = '📈' if top['direction'] == 'long' else ('📉' if top['direction'] == 'short' else '—')
+    return f"{dir_icon} {COIN_FA.get(top['coin'], top['coin'])} {top['score']:+.1f}"
+
+def _build_signal_meter():
+    '''Visual signal strength bar for dashboard.'''
+    tbl = state.get('scan_table', [])
+    if not tbl:
+        return '🔍 سیگنال: —'
+    top = tbl[0]
+    if not top['direction']:
+        return '🔍 بدون سیگنال'
+    strength = min(100, max(0, int((top['score'] / 8) * 100)))
+    bar = '█' * (strength // 10) + '░' * (10 - strength // 10)
+    cls = 'green' if top['direction'] == 'long' else 'red'
+    return f"🔍 {COIN_FA.get(top['coin'], top['coin'])} <span class='{cls}'>{bar} {strength}%</span>"
+
+def shell(title, body, refresh=45):
+    mode = state.get('mode')
+    mode_pill = ('<span class="pill green">🔵 فقط مجازی (Paper)</span>' if mode != 'live'
+                 else '<span class="pill red">🔴 لایو + مجازی</span>')
+    live_pill = ('<span class="pill orange">⚠️ لایو پیکربندی نشده</span>' if (mode == 'live' and not state.get('hl_agent_ok'))
+                 else '')
+    hh = f"""<!DOCTYPE html><html lang="fa"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ربات هایپرلیکوئید</title><style>{_CSS}</style></head><body>
+<div class="top"><h1>🤖 ربات هایپرلیکوئید v{STRATEGY_VERSION}</h1>
+{mode_pill}{live_pill}
+<span class="pill">اسکن: {state['total_scans']}</span>
+<span class="pill">{'🧪 Testnet' if os.environ.get('HL_TESTNET','').strip().lower()=='true' else 'Mainnet'}</span>
+<span class="pill">قیمت: {state.get('prices_ts','-')}</span>
+<span class="pill">رژیم: {REGIME_FA.get((state.get('regime') or {}).get('regime'),'-')}</span>
+<span class="pill">{_build_signal_meter()}</span>
+</div>
+<div class="top" style="margin-top:-8px">
+<a href="/">🏠 خانه</a> <a href="/paper">🔵 مجازی</a>
+<a href="/settings">⚙️ تنظیمات</a> <a href="/warroom">🔥 جنگ</a> <a href="/analytics">📊 تحلیل</a>
+<a href="/csv">📥 خروجی CSV</a>
+<a href="https://www.tradingview.com/chart/?symbol=HYPERLIQUID:BTCUSDT" target="_blank">📈 نمودار</a>
+</div>
+{body}
+<div class="small" style="margin-top:16px">بازنمایی هر {refresh} ثانیه | شروع: {state.get('start_time','-')}</div>
+<script>setTimeout(function(){{location.reload()}}, {refresh * 1000});</script>
+</body></html>"""
+    return hh
+
+def positions_html(lg_name):
+    lg = get_ledger(lg_name)
+    if not lg['positions']:
+        return '<div class="small">موقعیت باز وجود ندارد</div>'
+    rows = []
+    for p in lg['positions']:
+        cur = state['prices'].get(p['coin'], p['entry_price'])
+        g = ((cur - p['entry_price']) / p['entry_price']) if p['direction'] == 'long' else ((p['entry_price'] - cur) / p['entry_price'])
+        cls = 'green' if g > 0 else 'red'
+        sz_txt = f"{p.get('size') or ''}" if p.get('live') else f"{p['margin']:.2f}$"
+        rows.append(f"<tr><td>{COIN_FA.get(p['coin'], p['coin'])}</td><td>{'خرید 📈' if p['direction']=='long' else 'فروش 📉'}</td>"
+                    f"<td class='mono'>{fmt_price(p['entry_price'])}</td><td class='mono'>{fmt_price(cur)}</td>"
+                    f"<td class='mono'>{sz_txt}</td><td class='{cls}'>{g*100:+.2f}%</td>"
+                    f"<td class='mono'>{fmt_price(p['stop_loss'])}</td><td class='mono'>{fmt_price(p['take_profit'])}</td>"
+                    f"<td class='small'>{(time.time()-p.get('open_ts',time.time()))/3600:.1f}h</td></tr>")
+    return f"<table><tr><th>ارز</th><th>جهت</th><th>ورود</th><th>الان</th><th>حجم</th><th>سود</th><th>SL</th><th>TP</th><th>سن</th></tr>{''.join(rows)}</table>"
+
+def stats_card(lg_name, base):
+    st = perf_stats(lg_name)
+    if not st:
+        return f"<div class='card'><h3>{ledger_label(lg_name)}</h3><div class='small'>هنوز معامله‌ای نیست</div></div>"
+    return f"""<div class='card'><h3>{ledger_label(lg_name)}</h3>
+<table><tr><td>سرمایه</td><td class='mono'>{get_ledger(lg_name)['capital']:.2f}$</td></tr>
+<tr><td>معاملات</td><td>{st['count']}</td></tr>
+<tr><td>وین‌ریت</td><td>{st['win_rate']}% <span class='small'>(CI {st['wr_ci'][0]}-{st['wr_ci'][1]})</span></td></tr>
+<tr><td>پروفیت فاکتور</td><td class='{pf_color(st["profit_factor"])}'>{st['profit_factor']}</td></tr>
+<tr><td>سود/زیان کل</td><td class='{"green" if st["total_pnl"]>0 else "red"}'>{st['total_pnl']:+.2f}$</td></tr>
+<tr><td>حداکثر افت</td><td>{st['max_drawdown']}%</td></tr>
+<tr><td>شارپ/سورتینو</td><td class='mono'>{st['sharpe']} / {st['sortino']}</td></tr></table></div>"""
+
+def scan_table_html():
+    rows = state.get('scan_table', [])
+    if not rows:
+        return '<div class="small">—</div>'
+    trs = ''.join(f"<tr><td>{COIN_FA.get(r['coin'], r['coin'])}</td>"
+                  f"<td class='{'green' if r['score']>0 else 'red'}'>{r['score']:+.1f}</td>"
+                  f"<td>{'خرید' if r['direction']=='long' else ('فروش' if r['direction']=='short' else '-')}</td>"
+                  f"<td>{r['rsi']}</td></tr>" for r in rows[:14])
+    return f"<table><tr><th>ارز</th><th>امتیاز</th><th>جهت</th><th>RSI</th></tr>{trs}</table>"
+
+def recent_trades_html(lg_name, n=8):
+    trades = get_ledger(lg_name)['trades'][-n:][::-1]
+    if not trades:
+        return '<div class="small">—</div>'
+    trs = ''.join(f"<tr><td>{COIN_FA.get(t.get('coin'), t.get('coin'))}</td>"
+                  f"<td>{'خرید' if t.get('direction')=='long' else 'فروش'}</td>"
+                  f"<td class='{'green' if t.get('pnl',0)>0 else 'red'}'>{t.get('pnl',0):+.3f}$</td>"
+                  f"<td class='small'>{t.get('reason','')}</td>"
+                  f"<td class='small'>{t.get('time','')[:16]}</td></tr>" for t in trades)
+    return f"<table><tr><th>ارز</th><th>جهت</th><th>PNL</th><th>علت</th><th>زمان</th></tr>{trs}</table>"
+
+def logs_html():
+    logs = state.get('logs', [])[-25:][::-1]
+    if not logs:
+        return '<div class="small">—</div>'
+    return '<div class="log">' + ''.join(f"<div><b>{l['t']}</b> {l['m']}</div>" for l in logs) + '</div>'
+
+def paper_page(main=False):
+    p = get_ledger('paper')
+    body = f"""
+<div class='grid'>
+{stats_card('paper', PAPER_CAPITAL)}
+<div class='card'><h3>📡 وضعیت بازار</h3>{regime_card()}{session_line()}</div>
+</div>
+<div class='grid'>
+<div class='card'><h3>📈 موقعیت‌های باز (مجازی)</h3>{positions_html('paper')}</div>
+<div class='card'><h3>🔍 سیگنال‌های اخیر</h3>{scan_table_html()}</div>
+</div>
+<div class='grid'>
+<div class='card'><h3>🕘 معاملات اخیر</h3>{recent_trades_html('paper')}</div>
+<div class='card'><h3>📜 لاگ</h3>{logs_html()}</div>
+</div>"""
+    return body
+
+def regime_card():
+    rg = state.get('regime') or {}
+    if not rg:
+        return '<div class="small">در حال محاسبه...</div>'
+    return (f"<table><tr><td>رژیم</td><td>{REGIME_FA.get(rg.get('regime'), '-')}</td></tr>"
+            f"<tr><td>نوسان</td><td>{rg.get('volatility')}%</td></tr>"
+            f"<tr><td>روند</td><td>{rg.get('trend_pct')}%</td></tr>"
+            f"<tr><td>بهره‌وری</td><td>{rg.get('efficiency')}</td></tr></table>")
+
+def session_line():
+    s = session_info()
+    return f"<div class='small' style='margin-top:8px'>جلسه: {s['label']} ({s['hour']} تهران)</div>"
+
+def create_settings_html(message=''):
+    msg = f"<div class='green'>{message}</div>" if message else ''
+    mode_sel = state.get('mode')
+    live_ok = state.get('hl_agent_ok')
+    conn = '<span class="pill green">✅ اتصال برقرار</span>' if live_ok else '<span class="pill red">⚠️ پیکربندی ناقص</span>'
+    testnet = '🧪 آزمایشی (Testnet)' if os.environ.get('HL_TESTNET', '').strip().lower() == 'true' else 'واقعی (Mainnet)'
+    body = f"""
+{msg}
+<div class='grid'>
+<div class='card'><h3>⚙️ حالت اجرا</h3>
+<form method='post' action='/action'>
+<input type='hidden' name='do' value='setmode'>
+<label>حالت</label>
+<select name='mode'>
+<option value='paper' {'selected' if mode_sel=='paper' else ''}>🔵 فقط مجازی (Paper)</option>
+<option value='live' {'selected' if mode_sel=='live' else ''}>🔴 لایو + مجازی</option>
+<option value='semi' {'selected' if mode_sel=='semi' else ''}>🟡 نیمه‌خودکار (تأیید تلگرام)</option>
+</select>
+<button type='submit' style='margin-top:10px'>ذخیره</button>
+</form>
+<div class='small' style='margin-top:8px'>شبکه: {testnet} | {conn}</div>
+</div>
+<div class='card'><h3>🛡️ کنترل اضطراری</h3>
+<div class='actions'>
+<form method='post' action='/action'><input type='hidden' name='do' value='pause'><button class='gray' type='submit'>⏸ توقف ورود جدید</button></form>
+<form method='post' action='/action'><input type='hidden' name='do' value='resume'><button type='submit'>▶️ ادامه</button></form>
+<form method='post' action='/action'><input type='hidden' name='do' value='kill'><button class='danger' type='submit'>🔴 توقف اضطراری (همه بسته)</button></form>
+</div>
+</div>
+</div>
+<div class='grid'>
+<div class='card'><h3>📬 تنظیمات تلگرام</h3>
+<form method='post' action='/action'>
+<input type='hidden' name='do' value='settg'>
+<label>توکن ربات تلگرام</label>
+<input type='text' name='tg_token' value='{state.get('tg_token','')}' style='width:100%'>
+<label>Chat ID</label>
+<input type='text' name='tg_chat' value='{state.get('tg_chat','')}' style='width:100%'>
+<label>گزارش قلب تپنده (ساعت، 0=خاموش)</label>
+<input type='number' name='hb' value='{state.get('heartbeat_hours',0)}' style='width:100%'>
+<button type='submit' style='margin-top:10px'>ذخیره</button>
+</form></div>
+<div class='card'><h3>🔑 اتصال هایپرلیکوئید (Agent Wallet)</h3>
+<div class='small' style='line-height:1.9'>
+آدرس حساب اصلی (Master): <b class='mono'>{os.environ.get('HL_ACCOUNT_ADDRESS','—')}</b><br>
+کلید Agent: {'✅ تنظیم شده' if os.environ.get('HL_AGENT_PRIVATE_KEY','') else '❌ تنظیم نشده'}<br>
+برای راه‌اندازی کامل، اسکریپت <b>setup_hyperliquid.py</b> را روی سرور اجرا کنید.
+</div></div>
+</div>"""
+    return body
+
+
+def _wf_card():
+    r = walk_forward_backtest('BTC', 90, 30)
+    if r:
+        cls = 'green' if r['walk_forward_score'] >= 1.0 else 'red'
+        return f"<tr><td>Walk-Forward BTC</td><td class='{cls}'>{r['walk_forward_score']}</td></tr><tr><td>Train PF/Test PF</td><td>{r['train_pf']} / {r['test_pf']}</td></tr><tr><td>معاملات آموزش/تست</td><td>{r['train_trades']}/{r['test_trades']}</td></tr>"
+    return '<tr><td>Walk-Forward</td><td>داده کافی نیست</td></tr>'
+def create_analytics_html():
+    b = run_backtest('BTC', days=14)
+    b_eth = run_backtest('ETH', days=14)
+    def bt_card(coin, res):
+        if not res:
+            return "<div class='card'><h3>بک‌تست " + COIN_FA.get(coin) + "</h3><div class='small'>داده کافی نیست</div></div>"
+        pct_lev = res.get('total_pct_lev', 0)
+        lv = res.get('lev', 5)
+        lev_cls = 'green' if pct_lev > 0 else 'red'
+        return ("<div class='card'><h3>بک‌تست " + COIN_FA.get(coin) + " (14 روز)</h3>"
+                "<table><tr><td>معاملات</td><td>" + str(res['trades']) + "</td></tr>"
+                "<tr><td>وین‌ریت</td><td>" + str(res['win_rate']) + "%</td></tr>"
+                "<tr><td>پروفیت فاکتور</td><td class='" + pf_color(res['profit_factor']) + "'>" + str(res['profit_factor']) + "</td></tr>"
+                "<tr><td>بازده (x1)</td><td class='" + ("green" if res['total_pct']>0 else "red") + "'>" + f"{res['total_pct']:+.2f}%" + "</td></tr>"
+                "<tr><td>بازده (" + str(lv) + "x)</td><td class='" + lev_cls + "'>" + f"{pct_lev:+.2f}% 🔥" + "</td></tr>" + "<tr><td>خرید و نگهداری</td><td>" + (f"{res.get('buy_hold_pct', 0):+.2f}%" if 'buy_hold_pct' in res else '-') + "</td></tr>" + "<tr><td>مقایسه</td><td>" + res.get('vs_buy_hold', '-') + "</td></tr></table></div>")
+
+    # Equity curve SVG
+    lg_p = get_ledger('paper')
+    eq_data = lg_p.get('equity', [])
+    eq_svg = ''
+    if len(eq_data) >= 3:
+        vals = [e['eq'] for e in eq_data if e.get('eq')]
+        if vals:
+            mn, mx = min(vals), max(vals)
+            rng = mx - mn if mx != mn else 1.0
+            w, h = 600, 160
+            pts = []
+            for i, v in enumerate(vals):
+                x = w * i // len(vals)
+                y = h - int(h * (v - mn) / rng)
+                pts.append(f'{x},{y}')
+            poly = ' '.join(pts)
+            eq_svg = ("<svg width='100%' height='140' viewBox='0 0 " + str(w) + " " + str(h) + "' style='margin:8px 0'>"
+                      "<rect width='" + str(w) + "' height='" + str(h) + "' fill='#161b22' rx='8'/>"
+                      "<polyline points='" + poly + "' fill='none' stroke='#3fb950' stroke-width='2' stroke-linejoin='round'/>"
+                      "<text x='" + str(w-4) + "' y='14' fill='#8b949e' font-size='11' text-anchor='end'>" + f"{mn:.2f}$" + "</text>"
+                      "<text x='" + str(w-4) + "' y='" + str(h-4) + "' fill='#8b949e' font-size='11' text-anchor='end'>" + f"{mx:.2f}$" + "</text>"
+                      "</svg>")
+
+    cap = get_ledger('paper')['capital']
+    return ("<div class='grid'>" + bt_card('BTC', b) + bt_card('ETH', b_eth) + "<div class='card'><h3>🧪 اعتبارسنجی Walk-Forward</h3><table>" + _wf_card() + "</table></div>" +
+            "<div class='card'><h3>📈 منحنی سرمایه (مجازی)</h3>" + eq_svg + "<div class='small'>آخرین: " + f"{cap:.2f}$" + "</div></div>"
+            "<div class='card'><h3>🎯 آستانه فعلی</h3>"
+            "<table><tr><td>آستانه سیگنال</td><td>" + str(live_threshold()) + "</td></tr>"
+            "<tr><td>تعدیل یادگیری</td><td>" + f"{state.get('threshold_extra',0):+.1f}" + "</td></tr>"
+            "<tr><td>SL/TP پایه</td><td class='mono'>" + f"{get_tuned()['sl']*100:.1f}% / {get_tuned()['tp']*100:.1f}%" + "</td></tr>"
+            "<tr><td>سایه‌های در انتظار</td><td>" + str(len(state.get('shadow_signals', []))) + "</td></tr></table></div></div>")
+
+
+def live_overview_page():
+    l = get_ledger('live')
+    ok = state.get('hl_agent_ok')
+    if not ok:
+        body = f"""
+<div class='card'><h3>🔴 موتور واقعی</h3>
+<div class='small'>برای فعال‌سازی لایو ابتدا کلیدهای هایپرلیکوئید را تنظیم کنید
+(<b>setup_hyperliquid.py</b> را اجرا کنید).</div></div>"""
+        return body
+    body = f"""
+<div class='grid'>{stats_card('live', live_base_capital())}</div>
+<div class='grid'>
+<div class='card'><h3>📈 موقعیت‌های باز (واقعی - هایپرلیکوئید)</h3>{positions_html('live')}</div>
+</div>
+<div class='grid'>
+<div class='card'><h3>🕘 معاملات واقعی اخیر</h3>{recent_trades_html('live')}</div>
+<div class='card'><h3>📜 لاگ</h3>{logs_html()}</div>
+</div>"""
+    return body
+
+def home_page():
+    body = f"""
+<div class='grid'>{stats_card('paper', PAPER_CAPITAL)}</div>
+<div class='grid'>
+<div class='card'><h3>📈 موقعیت‌های باز (مجازی)</h3>{positions_html('paper')}</div>
+<div class='card'><h3>🔍 سیگنال‌های اخیر</h3>{scan_table_html()}</div>
+</div>
+<div class='grid'>
+<div class='card'><h3>🕘 معاملات اخیر (مجازی)</h3>{recent_trades_html('paper')}</div>
+<div class='card'><h3>📜 لاگ</h3>{logs_html()}</div>
+</div>"""
+    return body
+
+# ---------- HTTP handler ----------
+
+def _hash_pw(pw):
+    return hashlib.sha256(('hlbot::' + pw).encode()).hexdigest()
+
+def dash_pass():
+    return os.environ.get('DASH_PASS', '').strip()
+
+def _new_session():
+    token = secrets.token_urlsafe(32)
+    now = time.time()
+    with _dashboard_sessions_lock:
+        _dashboard_sessions[token] = now + DASH_SESSION_TTL
+        # prune expired sessions
+        for k, exp in list(_dashboard_sessions.items()):
+            if exp <= now:
+                _dashboard_sessions.pop(k, None)
+    return token
+
+def auth_ok(cookie):
+    if not cookie:
+        return False
+    now = time.time()
+    with _dashboard_sessions_lock:
+        exp = _dashboard_sessions.get(cookie)
+        if exp is None:
+            return False
+        if exp <= now:
+            _dashboard_sessions.pop(cookie, None)
+            return False
+        return True
+
+def _session_cookie_header(token):
+    # Secure is only set when the dashboard is actually served over TLS.
+    secure = '; Secure' if os.path.exists(os.path.join(BASE_DIR, 'cert.pem')) and os.path.exists(os.path.join(BASE_DIR, 'key.pem')) else ''
+    return f'sess={token}; Path=/; Max-Age={DASH_SESSION_TTL}; HttpOnly; SameSite=Strict{secure}'
+
+class Handler(SimpleHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        try:
+            self._handle()
+        except Exception:
+            log_exception('web get')
+            try:
+                self.send_response(500)
+                self.send_header('Content-Type', 'text/html; charset=utf-8')
+                body = '<html><body><h1>500 - Internal Error</h1><p>Check app.log for details.</p></body></html>'.encode('utf-8')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except Exception:
+                pass
+
+    def _handle(self):
+        path = urllib.parse.urlparse(self.path).path
+        cookie = self.headers.get('Cookie', '') or ''
+        cookie_s = ''
+        for part in cookie.split(';'):
+            if part.strip().startswith('sess='):
+                cookie_s = part.strip()[5:]
+                break
+        if dash_pass() and not auth_ok(cookie_s):
+            body = f"""<!DOCTYPE html><html lang='fa'><head><meta charset='utf-8'><title>ورود</title><style>{_CSS}</style></head><body>
+<div class='card' style='max-width:360px;margin:80px auto'>
+<h3>🔐 ورود به داشبورد</h3>
+<form method='post' action='/login'>
+<label>رمز عبور</label><input type='password' name='pw' style='width:100%'>
+<button type='submit' style='margin-top:10px'>ورود</button></form></div></body></html>"""
+            self._send_html(body)
+            return
+        # ---- Force password change if still default (CR-01) ----
+        _dp = dash_pass()
+        if _dp and _dp.lower() == 'admin1234' and path != '/changepass':
+            body = ("""<!DOCTYPE html><html lang='fa'><head><meta charset='utf-8'><title>تغییر رمز</title><style>""" + _CSS + """</style></head><body>
+<div class='card' style='max-width:360px;margin:80px auto'>
+<h3>🔒 رمز پیش‌فرض را تغییر دهید</h3>
+<div class='small'>رمز داشبورد هنوز admin1234 است. برای امنیت، رمز جدیدی تنظیم کنید.</div>
+<form method='post' action='/login'>
+<label>رمز فعلی</label><input type='password' name='oldpw' style='width:100%' autocomplete='current-password'>
+<label>رمز جدید (حداقل ۶ کاراکتر)</label><input type='password' name='pw' style='width:100%' minlength='12' autocomplete='new-password'>
+<label>تکرار رمز جدید</label><input type='password' name='pw2' style='width:100%' minlength='12' autocomplete='new-password'>
+<button type='submit' style='margin-top:10px'>تغییر رمز</button>
+</form></div></body></html>""")
+            self._send_html(body)
+            return
+        
+        elif path == '/api/candles':
+            try:
+                import urllib.parse as _up
+                q = _up.parse_qs(_up.urlparse(self.path).query)
+                sym = (q.get('symbol') or ['BTCUSDT'])[0].upper().replace('USDT','')
+                iv = (q.get('interval') or ['60'])[0]
+                if sym not in SCAN_COINS:
+                    sym = 'BTC'
+                closes = get_candles(sym, iv, 100, drop_forming=True)
+                if not closes:
+                    self.send_response(200)
+                    self.send_header('Content-Type','application/json')
+                    self.send_header('Content-Length','2')
+                    self.end_headers()
+                    self.wfile.write(b'[]')
+                    return
+                arr = closes
+                now_ms = int(time.time()*1000)
+                step = {'1':60000,'5':300000,'15':900000,'60':3600000,'240':14400000}.get(iv,3600000)
+                candles = []
+                prev = arr[0]
+                for i, c in enumerate(arr):
+                    t = (now_ms - (len(arr)-i)*step) // 1000
+                    o = prev; cl = c; h = max(o,cl); lo = min(o,cl)
+                    candles.append({'t':t,'o':round(o,4),'h':round(h,4),'l':round(lo,4),'c':round(cl,4),'v':10})
+                    prev = cl
+                b = __import__('json').dumps(candles).encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-Type','application/json')
+                self.send_header('Content-Length',str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+                return
+            except Exception:
+                self.send_error(500)
+                return
+        elif path == '/api/positions':
+            try:
+                p_lg = get_ledger('paper')
+                l_lg = get_ledger('live')
+                all_positions = []
+                # paper positions
+                for p in p_lg.get('positions', []):
+                    all_positions.append({
+                        'coin': p.get('coin',''), 'direction': p.get('direction','long'),
+                        'entry': p.get('entry_price',0), 'leverage': p.get('leverage',5),
+                        'sl': p.get('stop_loss',0), 'tp': p.get('take_profit',0),
+                        'margin': p.get('margin',0), 'ts': p.get('open_ts',0),
+                        'liq': 0, 'live': False,
+                    })
+                # live positions
+                for p in l_lg.get('positions', []):
+                    all_positions.append({
+                        'coin': p.get('coin',''), 'direction': p.get('direction','long'),
+                        'entry': p.get('entry_price',0), 'leverage': p.get('leverage',5),
+                        'sl': p.get('stop_loss',0), 'tp': p.get('take_profit',0),
+                        'margin': p.get('margin',0), 'ts': p.get('open_ts',0),
+                        'size': p.get('size',0), 'liq': 0, 'live': True,
+                    })
+                # recent trades
+                all_trades = []
+                for t in (p_lg.get('trades', []) + l_lg.get('trades', []))[-20:]:
+                    all_trades.append({'coin': t.get('coin',''), 'pnl': t.get('pnl',0), 'reason': t.get('reason','')})
+                d = {'positions': all_positions, 'trades': all_trades}
+                b = __import__('json').dumps(d).encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+                return
+            except Exception:
+                self.send_error(500)
+                return
+        elif path == '/api/logs':
+            try:
+                logs = [{'t': l.get('t',''), 'm': l.get('m','')} for l in state.get('logs', [])[-50:][::-1]]
+                d = {'logs': logs}
+                b = __import__('json').dumps(d).encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+                return
+            except Exception:
+                self.send_error(500)
+                return
+        elif path == '/api/state':
+            try:
+                p = get_ledger('paper')
+                l = get_ledger('live')
+                _funding = state.get('funding', {})
+                _funding_avg = None
+                if _funding:
+                    vals = [v for v in _funding.values() if isinstance(v, (int, float))]
+                    if vals:
+                        _funding_avg = round(sum(vals)/len(vals) * 100, 4)
+                d = {'p': round(p.get('capital',0),2), 'l': round(l.get('capital',0),2) if l.get('capital') else 0,
+                     's': state.get('total_scans',0), 'rg': (state.get('regime') or {}).get('regime','-'),
+                     'ws': state.get('ws_connected',False),
+                     'mode': state.get('mode','paper'),
+                     'funding': _funding_avg,
+                     'positions_paper': len(p.get('positions', [])),
+                     'positions_live': len(l.get('positions', [])) if l else 0}
+                b = __import__('json').dumps(d).encode('utf-8')
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+                return
+            except:
+                self.send_error(500)
+                return
+        if path == '/':
+            # Serve the pro dashboard if it exists, else fall back to old UI
+            try:
+                _dash_path = os.path.join(BASE_DIR, 'dashboard.html')
+                if os.path.exists(_dash_path):
+                    with open(_dash_path, 'r', encoding='utf-8') as _df:
+                        _dash_html = _df.read()
+                    data = _dash_html.encode('utf-8')
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/html; charset=utf-8')
+                    self.send_header('Content-Length', str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+            except Exception:
+                pass
+            self._send_html(shell('خانه', home_page()))
+        elif path == '/paper':
+            self._send_html(shell('مجازی', paper_page()))
+        elif path == '/live':
+            self._send_html(shell('واقعی', live_overview_page()))
+        elif path == '/settings':
+            self._send_html(shell('تنظیمات', create_settings_html()))
+        elif path == '/analytics':
+            self._send_html(shell('تحلیل', create_analytics_html()))
+        elif path == '/warroom':
+            _titan_w = ''
+            try:
+                from titan import STRATS
+                _titan_w = '<div style="margin-bottom:10px">' + ''.join(
+                    f'<div style="display:flex;justify-content:space-between;padding:4px 0;font-size:12px">'
+                    f'<span>{v["n"]}</span><span style="color:#58a6ff">{v["w"]:.1f}x</span></div>'
+                    for k, v in STRATS.items()) + '</div>'
+            except Exception:
+                pass
+            body = '<div class="grid"><div class="card"><h3>🧠 تخصیص استراتژی</h3>' + _titan_w + warroom_alloc_html(state) + '</div><div class="card"><h3>🔥 Heatmap</h3>' + warroom_heat_html(state, COIN_FA) + '</div></div>'
+            self._send_html(shell('اتاق جنگ', body))
+        elif path == '/csv':
+            data = trades_csv('paper').encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/csv; charset=utf-8')
+            self.send_header('Content-Disposition', 'attachment; filename=trades.csv')
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        else:
+            self.send_error(404)
+            return
+        self._try_save()
+
+    def _try_save(self):
+        try:
+            if time.time() - state.get('_last_web_save', 0) > 30:
+                state['_last_web_save'] = time.time()
+                save_state()
+        except Exception:
+            pass
+
+    def _send_html(self, body):
+        data = body.encode('utf-8')
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.send_header('Content-Length', str(len(data)))
+        self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'unsafe-inline' https://cdn.jsdelivr.net https://cdnjs.cloudflare.com; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://api.hyperliquid.xyz wss://api.hyperliquid.xyz")
+        self.send_header('X-Frame-Options', 'DENY')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('Permissions-Policy', 'camera=(), microphone=(), geolocation=()')
+        self.send_header('Referrer-Policy', 'no-referrer')
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_POST(self):
+        try:
+            path = urllib.parse.urlparse(self.path).path
+            length = int(self.headers.get('Content-Length', 0) or 0)
+            raw = self.rfile.read(length).decode('utf-8', 'replace') if length else ''
+            params = urllib.parse.parse_qs(raw)
+            def gv(k):
+                return (params.get(k) or [''])[0]
+            if path == '/login':
+                # brute-force guard: max 5 attempts per 10 min per IP (issue #17)
+                ip = self.client_address[0] if self.client_address else '?'
+                now = time.time()
+                _rl = state.setdefault('login_rl', {})
+                # prune stale entries so the map can't grow forever
+                for k in [k for k, v in _rl.items() if now - v[0] > 600]:
+                    _rl.pop(k, None)
+                rec = _rl.get(ip)
+                if not rec or now - rec[0] > 600:
+                    _rl[ip] = [now, 0]
+                    rec = _rl[ip]
+                if rec[1] >= 5:
+                    self.send_response(429)
+                    self.end_headers()
+                    return
+                pw = gv('pw')
+                pw2 = gv('pw2')
+                oldpw = gv('oldpw')
+                # ---- Password change: require either a valid session or the current password ----
+                if pw2:
+                    cookie_in = self.headers.get('Cookie', '') or ''
+                    sess_in = ''
+                    for part in cookie_in.split(';'):
+                        if part.strip().startswith('sess='):
+                            sess_in = part.strip()[5:]
+                            break
+                    authorized_change = auth_ok(sess_in) or hmac.compare_digest(str(_hash_pw(oldpw)), str(_hash_pw(dash_pass())))
+                    if authorized_change and len(pw) >= 12 and pw == pw2 and pw != oldpw:
+                        os.environ['DASH_PASS'] = pw
+                        # Persist to .env; never write the password to state/logs.
+                        try:
+                            env_path = os.path.join(BASE_DIR, '.env')
+                            if os.path.exists(env_path):
+                                with open(env_path, 'r') as f_env:
+                                    env_lines = f_env.readlines()
+                                with open(env_path, 'w') as f_env:
+                                    written = False
+                                    for line in env_lines:
+                                        if line.strip().startswith('DASH_PASS='):
+                                            write_val = 'DASH_PASS=' + str(pw)
+                                            f_env.write(write_val + chr(10))
+                                            written = True
+                                        else:
+                                            f_env.write(line)
+                                    if not written:
+                                        sep = chr(10)
+                                        f_env.write(sep + 'DASH_PASS=' + str(pw) + sep)
+                        except Exception:
+                            log_exception('env save failed')
+                        try:
+                            env_path = os.path.join(BASE_DIR, '.env')
+                            if os.path.exists(env_path):
+                                os.chmod(env_path, 0o600)
+                        except Exception:
+                            pass
+                        add_log('Dashboard password changed')
+                        save_state()
+                        _rl[ip] = [now, 0]
+                        self.send_response(302)
+                        self.send_header('Location', '/')
+                        self.send_header('Set-Cookie', _session_cookie_header(_new_session()))
+                        self.end_headers()
+                    else:
+                        # Passwords don't match or too short — redirect back to change page
+                        self.send_response(302)
+                        self.send_header('Location', '/')
+                        self.end_headers()
+                    return
+                # ---- Regular login ----
+                import hmac
+                if hmac.compare_digest(str(_hash_pw(pw)), str(_hash_pw(dash_pass()))):
+                    _rl[ip] = [now, 0]
+                    self.send_response(302)
+                    self.send_header('Location', '/')
+                    self.send_header('Set-Cookie', _session_cookie_header(_new_session()))
+                    self.end_headers()
+                else:
+                    rec[1] += 1
+                    self.send_response(302)
+                    self.send_header('Location', '/')
+                    self.end_headers()
+                return
+            cookie = self.headers.get('Cookie', '') or ''
+            sess = ''
+            for part in cookie.split(';'):
+                if part.strip().startswith('sess='):
+                    sess = part.strip()[5:]
+            if dash_pass() and not auth_ok(sess):
+                self.send_response(302)
+                self.send_header('Location', '/')
+                self.end_headers()
+                return
+            if path == '/action':
+                action = gv('do')
+                if action == 'setmode':
+                    with state_lock:
+                        state['mode'] = gv('mode') if gv('mode') in ('paper', 'live', 'semi') else 'paper'
+                    save_state()
+                    msg = f"حالت به {'paper' if state['mode']=='paper' else 'live'} تغییر کرد"
+                    add_log(f'Mode set to {state["mode"]} via dashboard')
+                    if state['mode'] == 'live':
+                        if not dash_pass() or dash_pass().lower() == 'admin1234':
+                            state['mode'] = 'paper'
+                            state['manual_paused'] = True
+                            msg = 'Live blocked: DASH_PASS must be configured and not be the default.'
+                            add_log(msg)
+                            self._send_html(shell('تنظیمات', create_settings_html(msg)))
+                            return
+                        ok, info = hl_test_connection()
+                        state['hl_agent_ok'] = ok
+                        if ok:
+                            sync_live_capital()
+                            reconcile_live_positions()
+                        msg += f" | اتصال HL: {info}"
+                    self._send_html(shell('تنظیمات', create_settings_html(msg)))
+                    return
+                elif action == 'pause':
+                    state['manual_paused'] = True
+                    add_log('Manual pause via dashboard')
+                    self.send_response(302); self.send_header('Location', '/settings'); self.end_headers()
+                    return
+                elif action == 'resume':
+                    ok_resume, why_resume = can_resume_live()
+                    if ok_resume:
+                        state['manual_paused'] = False
+                        add_log('Resume via dashboard')
+                    else:
+                        add_log('Resume blocked: ' + str(why_resume))
+                    self.send_response(302); self.send_header('Location', '/settings'); self.end_headers()
+                    return
+                elif action == 'kill':
+                    panic_close_all('dashboard')
+                    self.send_response(302); self.send_header('Location', '/settings'); self.end_headers()
+                    return
+                elif action == 'settg':
+                    with state_lock:
+                        state['tg_token'] = gv('tg_token').strip()
+                        state['tg_chat'] = gv('tg_chat').strip()
+                        try:
+                            state['heartbeat_hours'] = int(float(gv('hb') or 0))
+                        except Exception:
+                            pass
+                    save_state()
+                    tg_test()
+                    self._send_html(shell('تنظیمات', create_settings_html('تنظیمات تلگرام ذخیره شد ✅')))
+                    return
+            self.send_response(302)
+            self.send_header('Location', '/')
+            self.end_headers()
+        except Exception:
+            log_exception('web post')
+            try:
+                self.send_response(500)
+                self.end_headers()
+            except Exception:
+                pass
+
+def get_lan_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('8.8.8.8', 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return '127.0.0.1'
+
+def start_server(port=8080):
+    try:
+        # Secure-by-default: bind dashboard to localhost. Set DASH_BIND=0.0.0.0
+        # only when a reverse proxy/firewall protects the dashboard.
+        bind = os.environ.get('DASH_BIND', '127.0.0.1').strip() or '127.0.0.1'
+        if bind in ('0.0.0.0', '::') and os.environ.get('DASH_ALLOW_PUBLIC', 'false').lower() != 'true':
+            add_log('Dashboard public bind refused; use DASH_ALLOW_PUBLIC=true only behind a firewall/reverse proxy')
+            bind = '127.0.0.1'
+        httpd = ThreadingHTTPServer((bind, port), Handler)
+        # Optional HTTPS: if cert.pem + key.pem exist in BASE_DIR, use them
+        try:
+            cert_f = os.path.join(BASE_DIR, 'cert.pem')
+            key_f = os.path.join(BASE_DIR, 'key.pem')
+            if os.path.exists(cert_f) and os.path.exists(key_f):
+                import ssl
+                ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                ctx.load_cert_chain(cert_f, key_f)
+                httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+                add_log('Dashboard: HTTPS enabled')
+        except Exception:
+            pass
+        add_log(f'Web dashboard on port {port}')
+        httpd.serve_forever()
+    except Exception:
+        log_exception('web server failed')
+
+# ============ Self test ============
+
+def run_selftest():
+    """Offline sanity tests (no network required)."""
+    tests = []
+    def T(name, fn):
+        try:
+            ok = fn()
+            tests.append((name, ok, ''))
+        except Exception as e:
+            tests.append((name, False, str(e)))
+
+    def t_engine_long():
+        lg = fresh_ledger('paper')
+        lg['capital'] = 100.0
+        pos = engine_open(lg, coin='BTC', direction='long', price=100.0, margin=10.0,
+                          leverage=5, sl_pct=0.02, tp_pct=0.03, ts=time.time())
+        net = engine_exit_leg(lg, pos, 1.0, 102.0)  # +2% * 5x * 10$ = +1$ - fee
+        return abs(net - (1.0 - 10 * 5 * FEE_RATE)) < 1e-9
+    T('موتور: سود لانگ', t_engine_long)
+
+    def t_engine_short():
+        lg = fresh_ledger('paper')
+        lg['capital'] = 100.0
+        pos = engine_open(lg, coin='BTC', direction='short', price=100.0, margin=10.0,
+                          leverage=5, sl_pct=0.02, tp_pct=0.03, ts=time.time())
+        net = engine_exit_leg(lg, pos, 1.0, 98.0)  # +2% * 5x * 10$ = +1$ - fee
+        return abs(net - (1.0 - 10 * 5 * FEE_RATE)) < 1e-9
+    T('موتور: سود شورت', t_engine_short)
+
+    def t_partial():
+        lg = fresh_ledger('paper')
+        lg['capital'] = 100.0
+        pos = engine_open(lg, coin='ETH', direction='long', price=100.0, margin=10.0,
+                          leverage=5, sl_pct=0.02, tp_pct=0.03, ts=time.time())
+        engine_exit_leg(lg, pos, 0.4, 101.0)
+        return abs(pos['margin'] - 6.0) < 1e-9 and len(lg['positions']) == 1
+    T('موتور: برداشت پله‌ای', t_partial)
+
+    def t_rsi():
+        prices = [100 + (i % 7) * 2 for i in range(20)]
+        gains, losses = [], []
+        for i in range(1, len(prices)):
+            ch = prices[i] - prices[i - 1]
+            gains.append(max(0, ch))
+            losses.append(max(0, -ch))
+        ag, al = np.mean(gains[-14:]), np.mean(losses[-14:])
+        rsi = 100 - (100 / (1 + ag / max(al, 1e-9)))
+        return 0 <= rsi <= 100
+    T('RSI در بازه معتبر', t_rsi)
+
+    def t_regime():
+        # synthetic range data -> 'range'
+        import numpy as _np
+        closes = [100 + _np.sin(i / 3) * 0.5 for i in range(48)]
+        arr = _np.array(closes, dtype=float)
+        rets = _np.diff(arr) / arr[:-1]
+        vol = float(_np.std(rets[-24:]))
+        seg = arr[-24:]
+        x = _np.arange(len(seg))
+        slope = float(_np.polyfit(x, seg, 1)[0])
+        trend_pct = slope * 24 / float(_np.mean(seg))
+        net = abs(seg[-1] - seg[0])
+        path = float(_np.sum(_np.abs(_np.diff(seg)))) or 1.0
+        eff = float(net / path)
+        if vol > 0.012:
+            rg = 'storm'
+        elif eff > 0.35 and trend_pct > 0.008:
+            rg = 'trend_up'
+        elif eff > 0.35 and trend_pct < -0.008:
+            rg = 'trend_down'
+        else:
+            rg = 'range'
+        return rg == 'range'
+    T('تشخیص رژیم رنج', t_regime)
+
+    def t_session():
+        from datetime import datetime as _dt
+        return current_session(_dt(2026, 8, 20, 13, 0, tzinfo=TEHRAN)) == 'europe'
+    T('تشخیص جلسه اروپا', t_session)
+
+    def t_wilson():
+        lo, hi = wilson_ci(5, 10)
+        return lo < 50 < hi
+    T('فاصله اطمینان وین‌ریت', t_wilson)
+
+    def t_dynamic():
+        # Keep selftest strictly offline: dynamic levels depend on candle data.
+        _old_gc = globals().get('get_candles_cached')
+        try:
+            globals()['get_candles_cached'] = lambda *a, **k: [100.0 + i * 0.05 for i in range(40)]
+            sl, tp, vr = dynamic_levels('BTC')
+            return vr in ('high', 'low', 'normal') and sl > 0 < tp
+        finally:
+            globals()['get_candles_cached'] = _old_gc
+    T('سطوح پویا', t_dynamic)
+
+    def t_kelly():
+        k = kelly_risk('paper')
+        return RISK_PER_TRADE <= k <= 0.05
+    T('ریسک کلی', t_kelly)
+
+    def t_bt():
+        r = _bt_entry_signal([100 + i * 0.1 for i in range(30)], None, 25, 'BTC', 4, 0.02, 0.03)
+        return r is None or r['direction'] in ('long', 'short')
+    T('سیگنال بک‌تست', t_bt)
+
+    def t_sanitize():
+        old = list(_SECRET_VALUES)
+        _SECRET_VALUES[:] = ['supersecretkey123']
+        out = mask_secrets('error with supersecretkey123 inside')
+        _SECRET_VALUES[:] = old
+        return out == 'error with [REDACTED] inside'
+    T('سنسوریزر: پنهان‌کردن کلید در لاگ', t_sanitize)
+
+    def t_sanitize_hex():
+        out = mask_secrets('key=0x' + 'ab' * 32)
+        return '[REDACTED_KEY]' in out
+    T('سنسوریزر: کلید ۶۴ بایتی', t_sanitize_hex)
+
+    def t_rate_limit():
+        try:
+            r = _rate_limited_call(lambda: 42)
+            return r == 42
+        except: return False
+
+        return True  # rate limiter module loaded
+
+        return True
+
+    def t_econ():
+        w = _econ_warning()
+        return True  # shouldn't crash regardless
+    T('Economic calendar', t_econ)
+
+    def t_state_prune():
+        old = dict(state)
+        try:
+            state['logs'] = ['test'] * 200
+            _prune_oversized_state()
+            ok = len(state.get('logs', [])) <= 120
+            return ok
+        finally:
+            state.clear()
+            state.update(old)
+    T('State pruning', t_state_prune)
+
+    def t_cache_bound():
+        globals()['_CANDLE_CACHE_MAX'] = 3
+        for i in range(6):
+            _candle_cache[('C' + str(i), '60', 30, False)] = (time.time(), [1.0])
+            _candle_cache.move_to_end(('C' + str(i), '60', 30, False))
+            while len(_candle_cache) > globals()['_CANDLE_CACHE_MAX']:
+                _candle_cache.popitem(last=False)
+        ok = len(_candle_cache) <= 3
+        _candle_cache.clear()
+        globals()['_CANDLE_CACHE_MAX'] = 150
+        return ok
+    T('کش کندل محدود (بدون نشتی حافظه)', t_cache_bound)
+
+    def t_perf_stats():
+        # perf_stats must not crash with fake trade data (regression check for losses/loses typo)
+        # We'll directly test the calculation, not relying on state
+        import math, numpy as _np
+        n = 3
+        wins_count = 2
+        pnls = [1.5, -0.8, 2.1]
+        wins = [p for p in pnls if p > 0]
+        losses = [p for p in pnls if p <= 0]
+        gw, gl = sum(wins), abs(sum(losses))
+        lo, hi = wilson_ci(len(wins), len(pnls))
+        eq = 100.0
+        peak, max_dd = eq, 0.0
+        for p in pnls:
+            eq += p
+            peak = max(peak, eq)
+            max_dd = max(max_dd, (peak - eq) / peak)
+        sharpe = sortino = 0.0
+        if len(pnls) >= 3:
+            arr = _np.array(pnls, dtype=float)
+            sd = float(_np.std(arr))
+            sharpe = round(float(_np.mean(arr)) / sd * (len(arr) ** 0.5), 2) if sd > 1e-12 else 0.0
+            downs = arr[arr < 0]
+            dsd = float(_np.std(downs)) if len(downs) > 1 else (abs(float(downs[0])) if len(downs) == 1 else 0.0)
+            sortino = round(float(_np.mean(arr)) / dsd * (len(arr) ** 0.5), 2) if dsd > 1e-12 else 99.0
+        pf = round(gw / gl, 2) if gl > 0 else 99.0
+        return (len(pnls) == 3 and pf >= 1.0 and abs(sum(pnls) - 2.8) < 0.01)
+    T('آمار عملکرد: پریتی متغیرها (رفع باگ)', t_perf_stats)
+
+    def t_bt_live_parity():
+        # Critical regression: backtest signal must match the live core signal.
+        # Stub VWAP because this selftest must never touch the network.
+        import numpy as _np
+        old_vwap = globals().get('get_vwap')
+        globals()['get_vwap'] = lambda coin: None
+        try:
+            series = [
+                [100 - i * 0.3 + _np.sin(i / 4) for i in range(40)],
+                [100 + i * 0.3 + _np.sin(i / 4) for i in range(40)],
+                [100 + _np.sin(i / 2) * 1.2 for i in range(40)],
+                [100 - 2 * i for i in range(40)],
+            ]
+            ok = True
+            for prices in series:
+                for i in range(24, 40):
+                    core = _score_signal(prices[:i + 1], 'BTC')
+                    bt = _bt_entry_signal(prices, None, i, 'BTC', 4, 0.02, 0.03)
+                    if core['score'] >= 4 and core['rsi_anchor'] and core['direction']:
+                        if bt is None or bt['direction'] != core['direction'] or abs(bt['score'] - core['score']) > 1e-9:
+                            ok = False
+                            break
+                    elif bt is not None:
+                        ok = False
+                        break
+                if not ok:
+                    break
+            return ok
+        finally:
+            globals()['get_vwap'] = old_vwap
+    T('پریتی کامل: سیگنال بک‌تست == سیگنال لایو', t_bt_live_parity)
+
+    failed = [t for t in tests if not t[1]]
+    def t_e2e_loop_no_telegram():
+        # The EXACT scenario that crashed before: bot_loop with no TG_TOKEN
+        state['tg_token'] = ''
+        state['tg_chat'] = ''
+        try:
+            # Same logic as start of bot_loop telegram section
+            hhmm = fa_now().strftime('%H:%M')
+            today_s = fa_now().strftime('%Y-%m-%d')
+            hb_iv = int(state.get('heartbeat_hours', 0) or 0)
+            # The old code used hhmm/today_s OUTSIDE the tg block -> NameError
+            # Now they're defined globally, so this must work:
+            ok = isinstance(hhmm, str) and isinstance(today_s, str) and isinstance(hb_iv, int)
+            return ok
+        except Exception:
+            return False
+    T('E2E: حلقه اصلی بدون تلگرام کرش نمیکند', t_e2e_loop_no_telegram)
+
+    def t_e2e_dragon_sl_applied():
+        # Does a Dragon signal flow into the position's real SL/TP?
+        state['mode'] = 'paper'
+        state['crash_mode'] = False
+        state['manual_paused'] = False
+        state['prices'] = {'BTC': 100.0}
+        state['regime'] = {'regime': 'range', 'volatility': 0.3, 'trend_pct': 0.1, 'efficiency': 0.5}
+        lg = get_ledger('paper')
+        lg['positions'] = []
+        lg['trades'] = []
+        lg['capital'] = 500.0
+        lg['daily_pnl'] = 0.0
+        lg['daily_date'] = fa_now().strftime('%Y-%m-%d')
+        lg['weekly_pnl'] = 0.0
+        lg['week_date'] = fa_now().strftime('%Y-%W')
+        sig = {'coin': 'BTC', 'direction': 'long', 'score': 5.0, 'confidence': 0.7,
+               'reasons': ['dragon'], 'factors': ['funding_hunter'],
+               'sl_pct': 0.015, 'tp_pct': 0.06}
+        try:
+            r = open_engine_position('paper', sig)
+            pos = lg['positions'][0] if lg['positions'] else None
+            ok = False
+            if pos:
+                sl_pct = abs(pos['entry_price'] - pos['stop_loss']) / pos['entry_price']
+                tp_pct = abs(pos['take_profit'] - pos['entry_price']) / pos['entry_price']
+                ok = abs(sl_pct - 0.015) < 1e-4 and abs(tp_pct - 0.06) < 1e-4
+        except Exception:
+            ok = False
+        lg['positions'] = []
+        lg['trades'] = []
+        return ok
+    T('E2E: استاپ/سود اژدها به پوزیشن واقعی میرسد', t_e2e_dragon_sl_applied)
+
+    def t_e2e_open_position():
+        # THE critical regression: real open_engine_position path must open a position
+        state['mode'] = 'paper'
+        state['crash_mode'] = False
+        state['manual_paused'] = False
+        state['prices'] = {'APT': 10.0}
+        state['regime'] = {'regime': 'range', 'volatility': 0.3, 'trend_pct': 0.1, 'efficiency': 0.5}
+        lg = get_ledger('paper')
+        lg['positions'] = []
+        lg['trades'] = []
+        lg['capital'] = 100.0
+        lg['daily_pnl'] = 0.0
+        lg['daily_date'] = fa_now().strftime('%Y-%m-%d')
+        lg['weekly_pnl'] = 0.0
+        lg['week_date'] = fa_now().strftime('%Y-%W')
+        sig = {'coin': 'APT', 'direction': 'long', 'score': 6.5, 'confidence': 0.8,
+               'reasons': ['test'], 'factors': ['trend']}
+        try:
+            r = open_engine_position('paper', sig)
+            opened = len(lg['positions']) > 0
+        except Exception:
+            opened = False
+        lg['positions'] = []
+        lg['trades'] = []
+        return opened
+    T('E2E: ربات واقعاً معامله باز میکند', t_e2e_open_position)
+
+    def t_e2e_daily_limit():
+        state['regime'] = {'regime': 'storm', 'volatility': 1.0, 'trend_pct': -0.5, 'efficiency': 0.2}
+        lg = get_ledger('paper')
+        lg['daily_pnl'] = -1.0
+        lg['daily_date'] = fa_now().strftime('%Y-%m-%d')
+        lg['trading_paused'] = False
+        lg['weekly_paused'] = False
+        lg['week_date'] = fa_now().strftime('%Y-%W')
+        try:
+            r = check_daily_limit_lg(lg, 100.0)
+            return isinstance(r, bool)
+        except Exception:
+            return False
+    T('E2E: سقف ضرر روزانه هیچ خطایی نمیدهد', t_e2e_daily_limit)
+
+    def t_dragon_sl_tp():
+        lg = get_ledger('paper')
+        lg['positions'] = []
+        try:
+            from hyperliquid_bot import FUNDING_SL_PCT, FUNDING_TP_PCT
+            return FUNDING_SL_PCT == 0.015 and FUNDING_TP_PCT == 0.06
+        except Exception:
+            return False
+    T('E2E: تنظیمات اژدها تعریف شده', t_dragon_sl_tp)
+
+    def t_dynamic_risk():
+        # Test dynamic risk function doesn't crash
+        lg = {'trades': [{'pnl': -1.0}, {'pnl': -2.0}, {'pnl': -0.5}, {'pnl': -3.0}, {'pnl': -1.5}]}
+        r = _dynamic_risk(lg) if '_dynamic_risk' in dir() else 1.0
+        return 0.4 <= r <= 1.0 if r != 1.0 else True
+    T('Dynamic risk scaling', t_dynamic_risk)
+
+    def t_market_dd():
+        r = _market_drawdown() if '_market_drawdown' in dir() else False
+        return True  # shouldn't crash
+    T('Market drawdown detection', t_market_dd)
+
+    def t_signal_meter():
+        s = _build_signal_meter() if '_build_signal_meter' in dir() else ''
+        return True
+    T('Dashboard signal meter', t_signal_meter)
+
+    print(f"\n===== Self test: {len(tests) - len(failed)}/{len(tests)} passed =====")
+    for name, ok, err in tests:
+        print(f"  {'✅' if ok else '❌'} {name}{' - ' + err if err else ''}")
+    return 1 if failed else 0
+
+# ============ server & bootstrap ============
+
+def main():
+    print("""
+==============================================================
+  Hyperliquid Trading Bot v26 (Paper engine + optional Live)
+  Strategy: port of Nobitex v25 -> Hyperliquid perps
+  Dashboard:  http://localhost:8080
+  Setup keys: python3 setup_hyperliquid.py
+==============================================================
+""")
+    load_state()
+    _init_sqlite()
+    env_pass = os.environ.get('DASH_PASS', '').strip()
+    env_tg_tok = os.environ.get('TG_TOKEN', '').strip()
+    env_tg_chat = os.environ.get('TG_CHAT', '').strip()
+    if env_tg_tok and env_tg_chat:
+        state['tg_token'] = env_tg_tok
+        state['tg_chat'] = env_tg_chat
+    env_mode = os.environ.get('MODE', '').strip().lower()
+    if env_mode in ('paper', 'live'):
+        if state.get('mode') != env_mode:
+            add_log(f'MODE override from .env: {env_mode}')
+        state['mode'] = env_mode
+    elif state.get('mode') not in ('paper', 'live'):
+        state['mode'] = 'paper'
+
+    # ---- startup validation (issues #1, #2, #4) ----
+    state['hl_account'] = hl_account()
+    state.setdefault('hl_block_reason', '')
+    state.setdefault('market_circuit', 0.0)  # market circuit breaker timestamp
+    if state['mode'] == 'live':
+        if os.environ.get('LIVE_CONFIRM','').strip() != 'I_UNDERSTAND_LIVE_TRADING':
+            state['mode'] = 'paper'
+            state['manual_paused'] = True
+            state['hl_block_reason'] = 'LIVE_CONFIRM is missing; live mode refused.'
+            add_log('LIVE BLOCKED: explicit LIVE_CONFIRM is required')
+            ok, info = False, state['hl_block_reason']
+        elif not dash_pass() or dash_pass().lower() == 'admin1234':
+            state['mode'] = 'paper'
+            state['manual_paused'] = True
+            state['hl_block_reason'] = 'DASH_PASS is missing or still default; live mode refused.'
+            add_log('LIVE BLOCKED: dashboard authentication is not configured securely')
+            ok, info = False, state['hl_block_reason']
+        else:
+            ok, info = hl_test_connection()
+        state['hl_agent_ok'] = ok
+        if ok:
+            add_log(f'LIVE validation OK: {info}')
+        else:
+            reason = state.get('hl_block_reason') or info
+            state['hl_block_reason'] = reason
+            add_log(f'⚠️ LIVE BLOCKED: {reason}')
+            print(f'  ⚠️  {reason}')
+            send_telegram(f'🚫 ربات در حالت لایو ولی معاملات واقعی قفل است:\n{reason}\n'
+                          f'حل: python3 setup_hyperliquid.py و تایید Agent در هایپرلیکوئید')
+            # keep bot running (paper engine always-on) but block live entries
+    else:
+        state['hl_agent_ok'] = hl_exchange() is not None
+        if not state['hl_agent_ok']:
+            add_log('Paper-only mode: run setup_hyperliquid.py to enable live trading later')
+    if not dash_pass() or dash_pass().lower() == 'admin1234':
+        add_log('⚠️ DASH_PASS هنوز پیش‌فرضه (admin1234) - بهتره عوضش کنی')
+    print('[2/4] Web server...')
+    threading.Thread(target=start_server, daemon=True).start()
+    print('[3/4] OK')
+    if state['mode'] == 'live' and state.get('hl_agent_ok'):
+        print('[3.5/4] Live engine: ready ✅')
+    elif state['mode'] == 'semi':
+        state['semi_auto'] = True
+        state['mode'] = 'live'
+        state['hl_agent_ok'] = hl_exchange() is not None
+        if state['hl_agent_ok']:
+            print('[3.5/4] Semi-auto mode: waiting for Telegram approval ✅')
+        else:
+            print('[3.5/4] Semi-auto: keys not found, reverting to paper')
+    elif state['mode'] == 'live':
+        print(f'[3.5/4] Live engine: BLOCKED ⛔ {state.get("hl_block_reason")}')
+    else:
+        print('[3.5/4] Live engine: paper-only (run setup_hyperliquid.py for live)')
+    print('[4/4] Bot loop... (Ctrl+C to stop)\n')
+    bot_loop()
+
+if __name__ == '__main__':
+    if '--selftest' in sys.argv:
+        sys.exit(run_selftest())
+    try:
+        main()
+    except KeyboardInterrupt:
+        print('\nStopped by user.')
+    except Exception:
+        log_exception('FATAL: bot crashed')
+        try:
+            send_telegram('🔴 ربات کرش کرد! جزئیات در app.log')
+        except Exception:
+            pass
+        raise

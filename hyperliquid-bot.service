@@ -1,0 +1,20 @@
+[Unit]
+Description=Hyperliquid Final V1 Trading Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/hyperliquid-final-v1
+EnvironmentFile=/opt/hyperliquid-final-v1/.env
+ExecStart=/usr/bin/python3 /opt/hyperliquid-final-v1/hyperliquid_bot.py
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/hyperliquid-final-v1
+
+[Install]
+WantedBy=multi-user.target
