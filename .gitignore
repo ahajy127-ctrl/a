@@ -1,0 +1,30 @@
+# ===== Secrets & Config =====
+.env
+.env.*
+!.env.example
+
+# ===== Runtime Data =====
+state.json
+state.json.bak
+app.log
+*.log
+run.log
+trades.db
+trades.db-shm
+trades.db-wal
+CRITICAL_ALERT.txt
+
+# ===== Backups & Cache =====
+backups/
+__pycache__/
+*.pyc
+
+# ===== OS Files =====
+.DS_Store
+Thumbs.db
+
+# ===== Certs (HTTPS) =====
+cert.pem
+key.pem
+__pycache__/
+v2/state/
