@@ -1,5 +1,0 @@
-numpy>=1.26,<3
-requests>=2.31,<3
-hyperliquid-python-sdk>=0.19,<1
-websocket-client>=1.7,<2
-tzdata>=2024.1
